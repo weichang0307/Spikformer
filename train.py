@@ -11,6 +11,7 @@ import argparse
 import copy
 import time
 
+import numpy as np
 import torch
 import torch.nn as nn
 
@@ -147,6 +148,96 @@ def plot_history(history: dict, title: str, save_path: str = None):
     fig.tight_layout()
     if save_path:
         fig.savefig(save_path, dpi=150)
+    return fig
+
+
+def plot_histories(histories: dict, title: str = "Eval curve comparison", save_path: str = None):
+    """Like plot_history, but overlays any number of named runs.
+
+    `histories`: {run_name: history_dict} where each history_dict has
+    "step"/"loss"/"acc" lists (as returned by train_one_model, or loaded back
+    from a saved history.json).
+    """
+    import matplotlib.pyplot as plt
+
+    fig, axes = plt.subplots(1, 2, figsize=(10, 4))
+    for name, history in histories.items():
+        axes[0].plot(history["step"], history["loss"], label=name)
+        axes[1].plot(history["step"], history["acc"], label=name)
+    axes[0].set_xlabel("step")
+    axes[0].set_ylabel("eval loss")
+    axes[0].legend()
+    axes[1].set_xlabel("step")
+    axes[1].set_ylabel("eval accuracy")
+    axes[1].legend()
+
+    fig.suptitle(title)
+    fig.tight_layout()
+    if save_path:
+        fig.savefig(save_path, dpi=150)
+    return fig
+
+
+def checkpoint_attn_grid(model: nn.Module, checkpoints, seq: torch.Tensor, title: str,
+                          num_kv_pairs: int = None, max_cols: int = 8):
+    """Plot a [layer x checkpoint] grid of head-max attention heatmaps.
+
+    `checkpoints`: list of (step, state_dict), as stored in
+    history["checkpoints"] by train_one_model (or loaded back from disk).
+    Each cell is the max (not mean) over heads, so a position lights up if
+    *any* head attends there. Axis ticks are labeled with the actual input
+    token id at each position (bottom row / left column only, to keep it
+    legible). If `num_kv_pairs` is given, a dashed line marks the boundary
+    between round 1 and round 2.
+
+    Temporarily loads each checkpoint's weights into `model` to run the
+    forward pass, then restores the model's original weights before
+    returning.
+    """
+    import matplotlib.pyplot as plt
+
+    original_state = copy.deepcopy(model.state_dict())
+    tokens = seq[0].cpu().tolist()
+    L = len(tokens)
+
+    idxs = list(range(len(checkpoints)))
+    if len(idxs) > max_cols:
+        idxs = sorted(set(np.linspace(0, len(idxs) - 1, max_cols).round().astype(int).tolist()))
+
+    fig, axes = None, None
+    for col, i in enumerate(idxs):
+        step, state = checkpoints[i]
+        model.load_state_dict(state)
+        model.eval()
+        with torch.no_grad():
+            _, attn_maps = model(seq, return_attn=True)
+
+        depth = len(attn_maps)
+        if fig is None:
+            fig, axes = plt.subplots(depth, len(idxs), figsize=(2.6 * len(idxs), 2.8 * depth), squeeze=False)
+
+        for layer in range(depth):
+            mat = attn_maps[layer][0].amax(0).float().cpu().numpy()  # max over heads -> (L, L)
+            ax = axes[layer][col]
+            ax.imshow(mat, cmap="viridis", aspect="auto")
+            if num_kv_pairs is not None:
+                ax.axvline(2 * num_kv_pairs - 0.5, color="white", linewidth=0.8, linestyle="--")
+                ax.axhline(2 * num_kv_pairs - 0.5, color="white", linewidth=0.8, linestyle="--")
+
+            ax.set_xticks(range(L))
+            ax.set_yticks(range(L))
+            ax.set_xticklabels(tokens if layer == depth - 1 else [], fontsize=5, rotation=90)
+            ax.set_yticklabels(tokens if col == 0 else [], fontsize=5)
+            ax.tick_params(length=2)
+
+            if layer == 0:
+                ax.set_title(f"step {step}", fontsize=9)
+            if col == 0:
+                ax.set_ylabel(f"layer {layer}", fontsize=9)
+
+    fig.suptitle(f"{title}\n(tick labels = input token id at each position)")
+    fig.tight_layout()
+    model.load_state_dict(original_state)
     return fig
 
 
