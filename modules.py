@@ -1,6 +1,6 @@
 """Spiking Self Attention (SSA) block from Spikformer (Zhou et al., 2023),
 plus a matching spiking MLP block. Q, K, V are binary spike tensors produced
-by Linear -> LayerNorm -> LIF, so the attention matmuls are between {0,1}
+by Linear -> L1LayerNorm -> LIF, so the attention matmuls are between {0,1}
 tensors and no softmax/normalization is needed:
 
     SSA(Q, K, V) = SN( scale * (Q @ K^T) @ V )
@@ -15,6 +15,25 @@ import torch.nn as nn
 from neurons import LIFNeuron
 
 
+class L1LayerNorm(nn.Module):
+    """LayerNorm variant that centers by the mean like standard LayerNorm,
+    but scales by the mean absolute deviation (L1) instead of the standard
+    deviation (L2) -- cheaper (no square root) and used here in place of
+    LayerNorm everywhere (including in VanillaSelfAttentionBlock) so both
+    models stay on equal footing."""
+
+    def __init__(self, dim: int, eps: float = 1e-6):
+        super().__init__()
+        self.eps = eps
+        self.weight = nn.Parameter(torch.ones(dim))
+        self.bias = nn.Parameter(torch.zeros(dim))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x_centered = x - x.mean(dim=-1, keepdim=True)
+        mad = x_centered.abs().mean(dim=-1, keepdim=True)
+        return x_centered / (mad + self.eps) * self.weight + self.bias
+
+
 class SpikingSelfAttention(nn.Module):
     def __init__(self, dim: int, num_heads: int, qkv_bias: bool = False):
         super().__init__()
@@ -24,19 +43,19 @@ class SpikingSelfAttention(nn.Module):
         self.scale = 0.125  # fixed scale, as in Spikformer (inputs are already unit-scale spikes)
 
         self.q_linear = nn.Linear(dim, dim, bias=qkv_bias)
-        self.q_norm = nn.LayerNorm(dim)
+        self.q_norm = L1LayerNorm(dim)
         self.q_lif = LIFNeuron()
 
         self.k_linear = nn.Linear(dim, dim, bias=qkv_bias)
-        self.k_norm = nn.LayerNorm(dim)
+        self.k_norm = L1LayerNorm(dim)
         self.k_lif = LIFNeuron()
 
         self.v_linear = nn.Linear(dim, dim, bias=qkv_bias)
-        self.v_norm = nn.LayerNorm(dim)
+        self.v_norm = L1LayerNorm(dim)
         self.v_lif = LIFNeuron()
 
         self.proj_linear = nn.Linear(dim, dim)
-        self.proj_norm = nn.LayerNorm(dim)
+        self.proj_norm = L1LayerNorm(dim)
         self.proj_lif = LIFNeuron()
 
     def reset_state(self):
@@ -75,11 +94,11 @@ class SpikingMLP(nn.Module):
     def __init__(self, dim: int, hidden_dim: int):
         super().__init__()
         self.fc1 = nn.Linear(dim, hidden_dim)
-        self.norm1 = nn.LayerNorm(hidden_dim)
+        self.norm1 = L1LayerNorm(hidden_dim)
         self.lif1 = LIFNeuron()
 
         self.fc2 = nn.Linear(hidden_dim, dim)
-        self.norm2 = nn.LayerNorm(dim)
+        self.norm2 = L1LayerNorm(dim)
         self.lif2 = LIFNeuron()
 
     def reset_state(self):
@@ -93,9 +112,10 @@ class SpikingMLP(nn.Module):
 
 
 class VanillaSelfAttentionBlock(nn.Module):
-    """Standard post-LN transformer block (same architecture as
-    nn.TransformerEncoderLayer with norm_first=False and a GELU FFN), built
-    from nn.MultiheadAttention directly so per-head attention weights can be
+    """Standard post-norm transformer block (same architecture as
+    nn.TransformerEncoderLayer with norm_first=False and a GELU FFN, but with
+    L1LayerNorm in place of standard LayerNorm), built from
+    nn.MultiheadAttention directly so per-head attention weights can be
     retrieved for analysis -- nn.TransformerEncoderLayer's fast path does not
     expose them."""
 
@@ -104,8 +124,8 @@ class VanillaSelfAttentionBlock(nn.Module):
         self.self_attn = nn.MultiheadAttention(dim, num_heads, dropout=dropout, batch_first=True)
         self.linear1 = nn.Linear(dim, dim * mlp_ratio)
         self.linear2 = nn.Linear(dim * mlp_ratio, dim)
-        self.norm1 = nn.LayerNorm(dim)
-        self.norm2 = nn.LayerNorm(dim)
+        self.norm1 = L1LayerNorm(dim)
+        self.norm2 = L1LayerNorm(dim)
         self.dropout1 = nn.Dropout(dropout)
         self.dropout2 = nn.Dropout(dropout)
         self.dropout = nn.Dropout(dropout)
