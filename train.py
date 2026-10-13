@@ -5,6 +5,7 @@ Associative Recall task (induction-head style).
 Usage:
     python train.py
     python train.py --num_kv_pairs 16 --num_rounds 3 --steps 4000
+    python train.py --norm rms --encoder rate
 """
 
 import argparse
@@ -57,6 +58,7 @@ def train_one_model(name: str, model: nn.Module, mask: torch.Tensor, device: str
 
     history = {"step": [], "loss": [], "acc": [], "checkpoints": []}
     start = time.time()
+    over_threshold_count = 0
     for step in range(1, steps + 1):
         model.train()
         seq = generate_batch(
@@ -83,9 +85,15 @@ def train_one_model(name: str, model: nn.Module, mask: torch.Tensor, device: str
                 )
                 eval_logits = model(seq)
                 eval_loss, eval_acc = compute_loss_and_acc(eval_logits, seq, mask)
+            if eval_acc is not None and early_stop_acc is not None:
+                if eval_acc.item() >= early_stop_acc:
+                    over_threshold_count += 1
+                    print(f"over_threshold_count = {over_threshold_count}")
+                else:
+                    over_threshold_count = 0
+            
 
-        should_stop = (early_stop_acc is not None and eval_acc is not None
-                       and eval_acc.item() >= early_stop_acc)
+        should_stop = over_threshold_count >= 10
         if should_stop and checkpoint_every is not None:
             due_checkpoint = True  # always capture the step that triggered early stopping
 
@@ -207,6 +215,19 @@ def checkpoint_attn_grid(model: nn.Module, checkpoints, seq: torch.Tensor, title
     fig, axes = None, None
     for col, i in enumerate(idxs):
         step, state = checkpoints[i]
+        model_pos_embed = model.pos_embed
+        checkpoint_pos_embed = state["pos_embed"]
+        if checkpoint_pos_embed.shape[1] < L:
+            raise ValueError(
+                f"checkpoint at step {step} has positional embeddings for "
+                f"{checkpoint_pos_embed.shape[1]} positions, but the input has {L}"
+            )
+        if checkpoint_pos_embed.shape != model_pos_embed.shape:
+            state = dict(state)
+            compatible_pos_embed = model_pos_embed.detach().clone()
+            copied_len = min(checkpoint_pos_embed.shape[1], model_pos_embed.shape[1])
+            compatible_pos_embed[:, :copied_len] = checkpoint_pos_embed[:, :copied_len]
+            state["pos_embed"] = compatible_pos_embed
         model.load_state_dict(state)
         model.eval()
         with torch.no_grad():
@@ -252,6 +273,10 @@ def main():
     parser.add_argument("--depth", type=int, default=2)
     parser.add_argument("--num_heads", type=int, default=4)
     parser.add_argument("--T", type=int, default=4, help="spiking simulation time steps")
+    parser.add_argument("--norm", dest="norm_type", choices=("l1", "l2", "rms"), default="l1",
+                        help="normalization used throughout the spiking transformer")
+    parser.add_argument("--encoder", dest="encoder_type", choices=("identity", "rate"), default="identity",
+                        help="input encoder; rate samples Bernoulli spikes using sigmoid(input) rates")
 
     parser.add_argument("--batch_size", type=int, default=64)
     parser.add_argument("--eval_batch_size", type=int, default=512)
@@ -273,7 +298,10 @@ def main():
     print(f"vocab_size={V}, seq_len={L}, num_kv_pairs={args.num_kv_pairs}, num_rounds={args.num_rounds}")
 
     vanilla = VanillaTransformer(V, dim=args.dim, depth=args.depth, num_heads=args.num_heads, max_len=L)
-    spiking = SpikingTransformer(V, dim=args.dim, depth=args.depth, num_heads=args.num_heads, T=args.T, max_len=L)
+    spiking = SpikingTransformer(
+        V, dim=args.dim, depth=args.depth, num_heads=args.num_heads, T=args.T, max_len=L,
+        norm_type=args.norm_type, encoder_type=args.encoder_type,
+    )
 
     n_params_vanilla = sum(p.numel() for p in vanilla.parameters())
     n_params_spiking = sum(p.numel() for p in spiking.parameters())

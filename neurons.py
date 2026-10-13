@@ -11,7 +11,7 @@ import torch.nn as nn
 
 
 class SurrogateSpike(torch.autograd.Function):
-    alpha = 4.0
+    alpha = 2.0
 
     @staticmethod
     def forward(ctx, v_minus_threshold):
