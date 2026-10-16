@@ -1,0 +1,99 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Training Monitor</title>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.min.js"></script>
+<style>
+  :root { --bg: #fafafa; --card: #fff; --text: #1d1d1f; --muted: #6e6e73; --border: #e3e3e6; }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg: #161618; --card: #1f1f22; --text: #f2f2f4; --muted: #9a9aa0; --border: #333338; }
+  }
+  body { margin: 0; padding: 16px; background: var(--bg); color: var(--text);
+         font: 14px/1.4 system-ui, -apple-system, "Segoe UI", sans-serif; }
+  header { display: flex; align-items: baseline; gap: 12px; flex-wrap: wrap; margin-bottom: 12px; }
+  h1 { font-size: 18px; margin: 0; }
+  .muted { color: var(--muted); }
+  .grid { display: grid; gap: 12px; grid-template-columns: repeat(auto-fit, minmax(360px, 1fr)); }
+  .card { background: var(--card); border: 1px solid var(--border); border-radius: 10px; padding: 12px; }
+  .card h2 { font-size: 15px; margin: 0 0 4px; }
+  .stats { font-variant-numeric: tabular-nums; margin-bottom: 8px; }
+  .stats b { font-weight: 600; }
+  .charts { display: grid; gap: 8px; }
+  canvas { width: 100% !important; height: 220px !important; }
+  .stale { color: #d0703a; }
+</style>
+</head>
+<body>
+<header>
+  <h1>Training Monitor</h1>
+  <span class="muted">Refreshes every 5 s. Stop a run: <code>touch runs/&lt;run&gt;/STOP</code></span>
+</header>
+<div class="grid" id="grid"></div>
+<script>
+const params = new URLSearchParams(location.search);
+const RUNS = (params.get("runs") || "spike_8_32_32_T16,spike_12_32_32_T16,spike_16_32_32_T16").split(",");
+const COLORS = { train: "#9a9aa0", 4: "#e0803a", 8: "#3a8ee0", 16: "#2fa86b", 32: "#a35cd6" };
+const charts = {};
+
+function makeChart(canvas, yLabel, yMin, yMax, yType = "linear") {
+  return new Chart(canvas, {
+    type: "line",
+    data: { datasets: [] },
+    options: {
+      animation: false, parsing: false, normalized: true,
+      scales: {
+        x: { type: "linear", title: { display: true, text: "step" } },
+        y: { type: yType, min: yMin, max: yMax, title: { display: true, text: yLabel } },
+      },
+      plugins: { legend: { labels: { boxWidth: 12 } } },
+      elements: { point: { radius: 0 }, line: { borderWidth: 1.5 } },
+    },
+  });
+}
+
+function series(h, key) { return h.step.map((s, i) => ({ x: s, y: h[key][i] })); }
+
+for (const run of RUNS) {
+  const card = document.createElement("div");
+  card.className = "card";
+  card.innerHTML = `<h2>${run}</h2><div class="stats" id="stats-${run}">waiting for live.json…</div>
+    <div class="charts"><canvas id="acc-${run}"></canvas><canvas id="loss-${run}"></canvas></div>`;
+  document.getElementById("grid").appendChild(card);
+  charts[run] = {
+    acc: makeChart(document.getElementById(`acc-${run}`), "recall accuracy", 0, 1),
+    loss: makeChart(document.getElementById(`loss-${run}`), "loss (log scale)", undefined, undefined, "logarithmic"),
+  };
+}
+
+async function refresh() {
+  for (const run of RUNS) {
+    let h;
+    try {
+      const r = await fetch(`runs/${run}/live.json?t=${Date.now()}`, { cache: "no-store" });
+      if (!r.ok) continue;
+      h = await r.json();
+    } catch { continue; }
+    if (!h.step || !h.step.length) continue;
+    const Ts = Object.keys(h).filter(k => k.startsWith("acc_T")).map(k => +k.slice(5)).sort((a, b) => a - b);
+    for (const [metric, chart] of [["acc", charts[run].acc], ["loss", charts[run].loss]]) {
+      chart.data.datasets = [
+        { label: "train", data: series(h, `train_${metric}`), borderColor: COLORS.train, borderDash: [4, 3] },
+        ...Ts.map(T => ({ label: `eval T=${T}`, data: series(h, `${metric}_T${T}`), borderColor: COLORS[T] || "#888" })),
+      ];
+      chart.update();
+    }
+    const last = h.step.length - 1;
+    const pct = v => (100 * v).toFixed(1) + "%";
+    const minutes = (h.time[last] / 60).toFixed(1);
+    document.getElementById(`stats-${run}`).innerHTML =
+      `step <b>${h.step[last]}</b> · ${minutes} min · train <b>${pct(h.train_acc[last])}</b> · ` +
+      Ts.map(T => `T=${T} <b>${pct(h[`acc_T${T}`][last])}</b>`).join(" · ");
+  }
+}
+refresh();
+setInterval(refresh, 5000);
+</script>
+</body>
+</html>
