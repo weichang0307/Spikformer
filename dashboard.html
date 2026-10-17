@@ -14,7 +14,11 @@
          font: 14px/1.4 system-ui, -apple-system, "Segoe UI", sans-serif; }
   header { display: flex; align-items: baseline; gap: 12px; flex-wrap: wrap; margin-bottom: 12px; }
   h1 { font-size: 18px; margin: 0; }
-  h3 { font-size: 13px; margin: 12px 0 4px; color: var(--muted); font-weight: 600; }
+  details.section > summary { font-size: 13px; margin: 12px 0 6px; color: var(--muted); font-weight: 600;
+                              cursor: pointer; user-select: none; }
+  details.run > summary { cursor: pointer; user-select: none; list-style-position: outside; }
+  details.run > summary h2 { display: inline; }
+  details.chart > summary { font-size: 12px; color: var(--muted); cursor: pointer; user-select: none; margin: 2px 0; }
   .muted { color: var(--muted); }
   .grid { display: grid; gap: 12px; grid-template-columns: repeat(auto-fit, minmax(360px, 1fr)); }
   .card { background: var(--card); border: 1px solid var(--border); border-radius: 10px; padding: 12px; min-width: 0; }
@@ -22,7 +26,7 @@
   .stats { font-variant-numeric: tabular-nums; margin-bottom: 8px; }
   .stats b { font-weight: 600; }
   .charts { display: grid; gap: 8px; grid-template-columns: repeat(auto-fit, minmax(320px, 1fr)); }
-  .charts > div { min-width: 0; }
+  .charts > div, .charts > details { min-width: 0; }
   canvas { width: 100% !important; height: 220px !important; }
   pre.sample { margin: 8px 0 0; padding: 8px; max-height: 220px; overflow: auto; white-space: pre-wrap;
                background: var(--bg); border: 1px solid var(--border); border-radius: 6px; font-size: 12px; }
@@ -46,21 +50,33 @@ const GROUP_COLORS = { input: "#9a9aa0", head: "#8a6d3b", "block 0": "#e0803a", 
 // perLIF: values keyed by LIF name, averaged per block; pct: plot as %; log: log y axis.
 const HEALTH = [
   { section: "Spiking activity (val set, training T)" },
-  { field: "fire_rate", title: "LIF firing rate (%)", perLIF: true, pct: true, min: 0 },
-  { field: "fire_dead", title: "never-fired features (%)", perLIF: true, pct: true, min: 0, max: 100 },
-  { field: "fire_sat", title: "saturated features, rate ≥ 90% (%)", perLIF: true, pct: true, min: 0 },
+  { field: "fire_rate", title: "LIF firing rate (%)", perLIF: true, pct: true, fixed: [0, 100] },
+  { field: "fire_dead", title: "never-fired features (%)", perLIF: true, pct: true, floor10: true },
+  { field: "fire_sat", title: "saturated features, rate ≥ 90% (%)", perLIF: true, pct: true, floor10: true },
   { field: "surrogate", title: "mean surrogate gradient (peak 0.5)", perLIF: true, min: 0 },
   { section: "Optimisation" },
   { field: "lr", title: "learning rate (log)", scalar: true, log: true },
   { field: "grad_norm", title: "gradient norm (log)", log: true },
   { field: "update_ratio", title: "update / weight norm per step (log)", log: true },
   { field: "norm_gain", title: "mean |L1 norm gain|", min: 0 },
-  { field: "attn_scale", title: "SSA attention scale 2^s (log)", log: true },
+  { field: "gamma_min", title: "min L1 norm gain γ per block" },
+  { field: "gamma_max", title: "max L1 norm gain γ per block" },
+  { field: "beta_min", title: "min L1 norm bias β per block" },
+  { field: "beta_max", title: "max L1 norm bias β per block" },
+  { field: "attn_scale", title: "SSA attention scale 2^s (log)", log: true, hideIfConstant: true },
+  { field: "head_scale_spread", title: "largest / smallest head scale (log)", log: true, hideIfConstant: true },
   { section: "Attention and context use" },
+  { field: "attn_dead_heads", title: "dead heads, attention LIF < 0.5% (%)", pct: true, min: 0, max: 100 },
   { field: "attn_empty", title: "query rows with no Q·K overlap (%)", pct: true, min: 0, max: 100 },
   { field: "attn_entropy", title: "attention spread (1 = uniform over context)", min: 0, max: 1 },
   { field: "attn_local", title: "attention on last 8 positions (%)", pct: true, min: 0 },
   { field: "context_gain", title: "context gain: loss(self only) − loss (nats)", scalar: true },
+  { section: "Homeostatic bias (Q/K/V)" },
+  { field: "homeo_active", title: "Q/K/V features below target rate (%)", pct: true, min: 0, max: 100 },
+  { field: "homeo_high", title: "Q/K/V features above upper target (%)", pct: true, min: 0, max: 100 },
+  { field: "homeo_shift", title: "mean Q/K/V norm bias shift" },
+  { field: "homeo_shift_up", title: "Q/K/V bias raised (mean over features)" },
+  { field: "homeo_shift_down", title: "Q/K/V bias lowered (mean over features)" },
   { section: "Adaptive gradient clipping" },
   { field: "clip_frac", title: "steps clipped since last eval (%)", pct: true, min: 0 },
   { field: "grad_spike", title: "largest gradient / running average (log)", log: true },
@@ -121,37 +137,82 @@ function healthSeries(h, panel) {
 for (const run of RUNS) {
   const card = document.createElement("div");
   card.className = "card";
-  card.innerHTML = `<h2>${run}</h2><div class="stats" id="stats-${run}">waiting for live.json…</div>
-    <div class="charts"><div><canvas id="acc-${run}"></canvas></div><div><canvas id="loss-${run}"></canvas></div></div>
-    <div id="health-${run}"></div>
-    <pre class="sample" id="sample-${run}" hidden></pre>`;
+  card.innerHTML = `<details class="run" data-key="run:${run}"><summary><h2>${run}</h2></summary>
+    <div class="stats" id="stats-${run}">waiting for live.json…</div>
+    <div id="body-${run}"></div></details>`;
   document.getElementById("grid").appendChild(card);
+  const body = document.getElementById(`body-${run}`);
+  body.appendChild(makeSection("Loss and accuracy",
+    chartBoxHTML("next-char accuracy", `acc-${run}`) + chartBoxHTML("loss (log scale)", `loss-${run}`) +
+    chartBoxHTML("bits per character", `bpc-${run}`)));
+  body.querySelectorAll("details.chart").forEach(d => restoreOpen(d, true));
+  body.insertAdjacentHTML("beforeend", `<div id="health-${run}"></div>`);
+  const sample = makeSection("Latest sample", "", false);
+  sample.id = `samplebox-${run}`;
+  sample.hidden = true;
+  sample.querySelector(".charts").outerHTML = `<pre class="sample" id="sample-${run}"></pre>`;
+  body.appendChild(sample);
+  restoreOpen(card.querySelector("details.run"), true);
   charts[run] = {
-    acc: makeChart(document.getElementById(`acc-${run}`), "accuracy", 0, 1),
+    acc: makeChart(document.getElementById(`acc-${run}`), "accuracy"),  // y range follows the data
     loss: makeChart(document.getElementById(`loss-${run}`), "loss (log scale)", undefined, undefined, "logarithmic"),
+    bpc: makeChart(document.getElementById(`bpc-${run}`), "bits per character"),
     health: null,
   };
 }
 
 // build the health panels the first time a run's live.json has them
+// Collapsible sections: a <details> per group of charts. Open / closed state is
+// remembered per section title in this browser (a viewer convenience only).
+function restoreOpen(details, byDefault) {
+  let open = byDefault;
+  try {
+    const saved = localStorage.getItem("dash-open:" + details.dataset.key);
+    if (saved !== null) open = saved === "1";
+  } catch {}
+  details.open = open;
+  details.addEventListener("toggle", () => {
+    try { localStorage.setItem("dash-open:" + details.dataset.key, details.open ? "1" : "0"); } catch {}
+    // charts drawn while hidden have no size: resize them when the section opens
+    if (details.open) details.querySelectorAll("canvas").forEach(c => Chart.getChart(c)?.resize());
+  });
+}
+
+// one collapsible box per chart (state remembered per chart title)
+function chartBoxHTML(title, canvasId) {
+  return `<details class="chart" data-key="chart:${title}"><summary>${title}</summary>` +
+         `<canvas${canvasId ? ` id="${canvasId}"` : ""}></canvas></details>`;
+}
+
+function makeSection(title, innerHTML, byDefault = true) {
+  const d = document.createElement("details");
+  d.className = "section";
+  d.dataset.key = "section:" + title;
+  d.innerHTML = `<summary>${title}</summary><div class="charts">${innerHTML}</div>`;
+  restoreOpen(d, byDefault);
+  return d;
+}
+
 function buildHealth(run, h) {
   const root = document.getElementById(`health-${run}`);
   const made = {};
   let box = null;
   for (const panel of HEALTH) {
     if (panel.section) {
-      root.insertAdjacentHTML("beforeend", `<h3>${panel.section}</h3>`);
-      box = document.createElement("div");
-      box.className = "charts";
-      root.appendChild(box);
+      const sec = makeSection(panel.section, "");
+      root.appendChild(sec);
+      box = sec.querySelector(".charts");
       continue;
     }
     if (!(panel.field in h)) continue;
-    const wrap = document.createElement("div");
-    const canvas = document.createElement("canvas");
-    wrap.appendChild(canvas);
-    box.appendChild(wrap);
-    made[panel.field] = makeChart(canvas, panel.title, panel.min, panel.max, panel.log ? "logarithmic" : "linear");
+    box.insertAdjacentHTML("beforeend", chartBoxHTML(panel.title));
+    const wrap = box.lastElementChild;
+    const canvas = wrap.querySelector("canvas");
+    restoreOpen(wrap, true);
+    // y range follows the data on every chart (panel.min / max are not applied)
+    // (panel.fixed: a fixed axis, used for the firing rate's 0-100%)
+    made[panel.field] = makeChart(canvas, panel.title, panel.fixed?.[0], panel.fixed?.[1],
+                                  panel.log ? "logarithmic" : "linear");
   }
   return made;
 }
@@ -165,6 +226,10 @@ async function refresh() {
       h = await r.json();
     } catch { continue; }
     if (!h.step || !h.step.length) continue;
+    // derived: steps per second between consecutive evaluations (wall clock, includes evaluation)
+    if (h.time && h.time.length === h.step.length)
+      h.steps_per_s = h.step.map((s, i) => i ? (s - h.step[i - 1]) / Math.max(h.time[i] - h.time[i - 1], 1e-9)
+                                               : s / Math.max(h.time[0], 1e-9));
     const charLM = "bpc" in h;  // train_char.py run: next-character accuracy and bits per char
     if (charLM && !charts[run].charLM) {
       charts[run].charLM = true;
@@ -179,18 +244,41 @@ async function refresh() {
       ];
       chart.update();
     }
+    // bits per character: val at each eval T, train = train loss / ln 2 (char LM runs only)
+    const bpcBox = charts[run].bpc.canvas.closest("details");
+    bpcBox.style.display = charLM ? "" : "none";
+    if (charLM) {
+      charts[run].bpc.data.datasets = [
+        { label: "train", data: h.step.map((s, i) => ({ x: s, y: h.train_loss[i] / Math.LN2 })),
+          borderColor: COLORS.train, borderDash: [4, 3] },
+        ...Ts.map(T => ({ label: `eval T=${T}`, data: series(h, `bpc_T${T}`), borderColor: COLORS[T] || "#888" })),
+      ];
+      charts[run].bpc.update();
+    }
     if (!charts[run].health && HEALTH.some(p => p.field && p.field in h)) charts[run].health = buildHealth(run, h);
     for (const panel of HEALTH) {
       const chart = charts[run].health && charts[run].health[panel.field];
       if (!chart) continue;
       chart.data.datasets = healthSeries(h, panel);
+      if (panel.floor10) {  // 0-10% axis while every value is below 10%, adaptive above that
+        const top = Math.max(...chart.data.datasets.flatMap(d => d.data.map(p => p.y)));
+        chart.options.scales.y.min = top < 10 ? 0 : undefined;
+        chart.options.scales.y.max = top < 10 ? 10 : undefined;
+      }
+      // hide the attention-scale charts when the scale is fixed (not learnable) in this run
+      if (panel.hideIfConstant) {
+        const ys = chart.data.datasets.flatMap(d => d.data.map(p => p.y));
+        chart.canvas.parentElement.style.display = ys.length > 1 && ys.every(y => y === ys[0]) ? "none" : "";
+      }
       chart.update();
     }
     const last = h.step.length - 1;
     const pct = v => (100 * v).toFixed(1) + "%";
     const minutes = (h.time[last] / 60).toFixed(1);
     document.getElementById(`stats-${run}`).innerHTML =
-      `step <b>${h.step[last]}</b> · ${minutes} min · train <b>${pct(h.train_acc[last])}</b> · ` +
+      `step <b>${h.step[last]}</b> · ${minutes} min` +
+      (h.steps_per_s ? ` · <b>${h.steps_per_s[last].toFixed(2)}</b> steps/s` : "") +
+      ` · train <b>${pct(h.train_acc[last])}</b> · ` +
       Ts.map(T => `T=${T} <b>${pct(h[`acc_T${T}`][last])}</b>` +
                   (charLM ? ` / <b>${h[`bpc_T${T}`][last].toFixed(3)}</b> bpc` : "")).join(" · ") +
       (charLM ? ` · best <b>${Math.min(...h.bpc).toFixed(3)}</b> bpc` : "");
@@ -200,7 +288,10 @@ async function refresh() {
         if (r.ok) {
           const blocks = (await r.text()).split(/^=== /m).filter(b => b.trim());
           const el = document.getElementById(`sample-${run}`);
-          if (blocks.length) { el.textContent = "=== " + blocks[blocks.length - 1].trimEnd(); el.hidden = false; }
+          if (blocks.length) {
+            el.textContent = "=== " + blocks[blocks.length - 1].trimEnd();
+            document.getElementById(`samplebox-${run}`).hidden = false;
+          }
         }
       } catch {}
     }

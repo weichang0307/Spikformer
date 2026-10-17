@@ -18,13 +18,21 @@ rewritten whenever the val loss improves, so it survives a crash or kill.
 
 --init_from RUN_DIR/best.pt continues from saved weights (model flags must
 match; the optimizer starts fresh), e.g. to fine-tune with a decaying lr.
+--resume continues a stopped run losslessly from RUN_DIR/last.pt (weights,
+optimizer, step, clipper / homeostasis state, history, RNG): rerun the same
+command with --resume. last.pt is written every --save_every steps and when
+the run is stopped by RUN_DIR/STOP, Ctrl-C or kill (SIGINT / SIGTERM).
+--bf16 and --compile make training about 2x faster.
 
 With --steps 0 the run has no end: after warmup the learning rate stays
 constant and training continues until RUN_DIR/STOP appears.
 """
 
 import argparse
+import contextlib
 import itertools
+import random
+import signal
 import json
 import math
 import os
@@ -34,7 +42,7 @@ import torch
 import torch.nn as nn
 
 from char_data import DEFAULT_PATH, CharDataset
-from health import AdaptiveClipper, LIFMonitor, UpdateTracker, attention_and_context, param_stats
+from health import AdaptiveClipper, Homeostasis, LIFMonitor, UpdateTracker, attention_and_context, param_stats
 from models import SpikingTransformer
 from train import pick_device, save_run, write_live
 
@@ -49,12 +57,13 @@ def loss_and_acc(model: nn.Module, seq: torch.Tensor):
 
 @torch.no_grad()
 def generate(model: nn.Module, data: CharDataset, prompt: str, num_chars: int, block_size: int,
-             temperature: float = 1.0, device="cpu") -> str:
+             temperature: float = 1.0, device="cpu", amp=contextlib.nullcontext) -> str:
     """Autoregressive sampling; the context is cropped to the last block_size chars."""
     model.eval()
     ids = torch.tensor([data.encode(prompt)], dtype=torch.long, device=device)
     for _ in range(num_chars):
-        logits = model(ids[:, -block_size:])[:, -1] / temperature
+        with amp():
+            logits = model(ids[:, -block_size:])[:, -1].float() / temperature
         next_id = torch.multinomial(torch.softmax(logits, -1), 1)
         ids = torch.cat([ids, next_id], dim=1)
     return data.decode(ids[0].tolist())
@@ -72,7 +81,12 @@ def train(model: nn.Module, data: CharDataset, args, device: str, run_dir: str) 
     open_ended = args.steps <= 0
     warmup = args.warmup_steps if open_ended else min(args.warmup_steps, args.steps)
 
+    cooldown = {"start": None}  # set below when --cooldown is given (or restored from last.pt)
+
     def lr_at(step):  # linear warmup, then cosine decay to lr / 10 (constant if open-ended)
+        if cooldown["start"] is not None:  # --cooldown: cosine from lr to lr / 10 over N steps from its start
+            progress = min((step - cooldown["start"]) / args.cooldown, 1.0)
+            return args.lr * (0.1 + 0.9 * 0.5 * (1 + math.cos(math.pi * progress)))
         if step <= warmup:
             return args.lr * step / max(warmup, 1)
         if open_ended:
@@ -88,17 +102,37 @@ def train(model: nn.Module, data: CharDataset, args, device: str, run_dir: str) 
         history[f"acc_T{T}"], history[f"loss_T{T}"], history[f"bpc_T{T}"] = [], [], []
     # training-health metrics (see health.py): {name: [one value per evaluation]}
     health_keys = ("fire_rate", "fire_dead", "fire_sat", "surrogate", "grad_norm", "update_ratio",
-                   "norm_gain", "attn_scale", "attn_empty", "attn_entropy", "attn_local")
+                   "norm_gain", "gamma_min", "gamma_max", "beta_min", "beta_max",
+                   "attn_scale", "head_scale_spread", "attn_empty", "attn_entropy", "attn_local",
+                   "attn_dead_heads")
     if args.adaptive_clip > 0:
         health_keys += ("clip_frac", "grad_spike")
+    if args.homeostasis > 0:
+        health_keys += (("homeo_active", "homeo_shift", "homeo_shift_up", "homeo_shift_down")
+                        + (("homeo_high",) if args.homeo_upper > 0 else ()))
     for key in health_keys:
         history[key] = {}
     history["context_gain"] = []
     lif_monitor, updates = LIFMonitor(model), UpdateTracker(model)
     clipper = AdaptiveClipper(model, args.adaptive_clip) if args.adaptive_clip > 0 else None
+    homeo = (Homeostasis(model, args.homeostasis, args.homeo_eta, upper=args.homeo_upper,
+                         units=tuple(args.homeo_units.split(",")))
+             if args.homeostasis > 0 else None)
     update_ratios = {}
 
+    # bf16 autocast for forward passes; torch.compile for the training forward only
+    # (evaluation and sampling use the plain module: they run with monitoring hooks
+    # and other sequence lengths, which would force recompiles)
+    amp = (lambda: torch.autocast("cuda", dtype=torch.bfloat16)) if args.bf16 else contextlib.nullcontext
+    if args.compile:
+        # each homeostasis / monitoring hook is compiled once per LIF it is attached to
+        # (20+ in a 4-block model), more than dynamo's default of 8 versions per function
+        torch._dynamo.config.recompile_limit = 64
+        torch._dynamo.config.cache_size_limit = 64
+    train_model = torch.compile(model) if args.compile else model
+
     stop_file = os.path.join(run_dir, "STOP")
+    last_path = os.path.join(run_dir, "last.pt")
     ckpt_dir = os.path.join(run_dir, "checkpoints")
     os.makedirs(ckpt_dir, exist_ok=True)
     samples_path = os.path.join(run_dir, "samples.txt")
@@ -112,13 +146,61 @@ def train(model: nn.Module, data: CharDataset, args, device: str, run_dir: str) 
     val_batches = []
     for _ in range(args.eval_iters):
         starts = torch.randint(len(val_data) - args.block_size - 1, (args.eval_batch_size,), generator=gen)
-        val_batches.append(torch.stack([val_data[s: s + args.block_size + 1] for s in starts.tolist()]))
+        val_batches.append(torch.stack([val_data[s: s + args.block_size + 1] for s in starts.tolist()]).long())
 
     best_loss, best_state = float("inf"), None
-    start = time.time()
     train_loss_sum = train_acc_sum = 0.0
     train_count = 0
-    for step in itertools.count(1) if open_ended else range(1, args.steps + 1):
+    first_step = 1
+
+    def save_last(step):
+        """Full training state, so --resume continues exactly where this run stopped."""
+        torch.save({"step": step, "model": model.state_dict(), "optimizer": optimizer.state_dict(),
+                    "cooldown_start": cooldown["start"],
+                    "clipper": clipper.state_dict() if clipper else None,
+                    "homeo": homeo.state_dict() if homeo else None,
+                    "history": {k: v for k, v in history.items() if k not in ("checkpoints", "final_state")},
+                    "best_loss": best_loss, "train_sums": (train_loss_sum, train_acc_sum, train_count),
+                    "rng": {"torch": torch.get_rng_state(), "cuda": torch.cuda.get_rng_state_all(),
+                            "python": random.getstate()}},
+                   last_path + ".tmp")
+        os.replace(last_path + ".tmp", last_path)
+
+    if args.resume:
+        state = torch.load(last_path, map_location="cpu", weights_only=False)
+        model.load_state_dict(state["model"])
+        optimizer.load_state_dict(state["optimizer"])
+        if clipper and state["clipper"]:
+            clipper.load_state_dict(state["clipper"])
+        if homeo and state["homeo"]:
+            homeo.load_state_dict(state["homeo"])
+        history.update(state["history"])
+        best_loss = state["best_loss"]
+        train_loss_sum, train_acc_sum, train_count = state["train_sums"]
+        torch.set_rng_state(state["rng"]["torch"])
+        torch.cuda.set_rng_state_all(state["rng"]["cuda"])
+        random.setstate(state["rng"]["python"])
+        first_step = state["step"] + 1
+        if args.cooldown > 0 and state.get("cooldown_start") is not None:
+            cooldown["start"] = state["cooldown_start"]  # resuming in the middle of a cooldown
+        if os.path.exists(os.path.join(run_dir, "best.pt")):
+            best_state = torch.load(os.path.join(run_dir, "best.pt"), map_location="cpu")
+        print(f"resumed from {last_path} at step {state['step']}", flush=True)
+
+    # Ctrl-C / kill: finish the current step, save last.pt and exit
+    signal_stop = []
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        signal.signal(sig, lambda signum, frame: signal_stop.append(signum))
+
+    start = time.time() - (history["time"][-1] if history["time"] else 0.0)
+    if args.cooldown > 0:
+        if cooldown["start"] is None:
+            cooldown["start"] = first_step - 1
+        print(f"cooldown: lr {args.lr:.1e} -> {args.lr / 10:.1e} (cosine) over steps "
+              f"{cooldown['start'] + 1}-{cooldown['start'] + args.cooldown}, then stop", flush=True)
+    cooldown_end = cooldown["start"] + args.cooldown if args.cooldown > 0 else None
+    for step in itertools.count(first_step) if open_ended else range(first_step, args.steps + 1):
+        final = step == args.steps or (cooldown_end is not None and step >= cooldown_end)
         for group in optimizer.param_groups:
             group["lr"] = lr_at(step)
         model.train()
@@ -126,7 +208,8 @@ def train(model: nn.Module, data: CharDataset, args, device: str, run_dir: str) 
         loss = acc = 0.0
         for _ in range(args.grad_accum):  # micro-batches summing to one batch of batch_size
             seq = data.get_batch("train", args.batch_size // args.grad_accum, args.block_size, device=device)
-            micro_loss, micro_acc = loss_and_acc(model, seq)
+            with amp():
+                micro_loss, micro_acc = loss_and_acc(train_model, seq)
             (micro_loss / args.grad_accum).backward()
             loss += micro_loss.item() / args.grad_accum
             acc += micro_acc.item() / args.grad_accum
@@ -137,6 +220,8 @@ def train(model: nn.Module, data: CharDataset, args, device: str, run_dir: str) 
         if step % args.eval_every == 0:
             updates.snapshot()
         optimizer.step()
+        if homeo is not None:
+            homeo.step()
         if step % args.eval_every == 0:
             update_ratios = updates.ratios()
         train_loss_sum += loss
@@ -144,20 +229,24 @@ def train(model: nn.Module, data: CharDataset, args, device: str, run_dir: str) 
         train_count += 1
 
         user_stop = os.path.exists(stop_file)
-        if step % args.eval_every == 0 or step == args.steps or user_stop:
+        if step % args.eval_every == 0 or final or user_stop:
             health = dict(param_stats(model), update_ratio=update_ratios)
             if clipper is not None:
                 health.update(clipper.stats())
+            if homeo is not None:
+                health.update(homeo.stats())
             model.eval()
             with torch.no_grad():
                 for T in eval_Ts:
                     model.T = T
                     if T == train_T:
                         lif_monitor.start()
-                    losses, accs = zip(*(loss_and_acc(model, b.to(device)) for b in val_batches))
+                    with amp():
+                        losses, accs = zip(*(loss_and_acc(model, b.to(device)) for b in val_batches))
                     if T == train_T:
                         health.update(lif_monitor.stop())
-                        health.update(attention_and_context(model, [b.to(device) for b in val_batches[:2]]))
+                        with amp():
+                            health.update(attention_and_context(model, [b.to(device) for b in val_batches[:2]]))
                     eval_loss = torch.stack(losses).mean().item()
                     history[f"loss_T{T}"].append(eval_loss)
                     history[f"bpc_T{T}"].append(eval_loss / math.log(2))
@@ -198,18 +287,27 @@ def train(model: nn.Module, data: CharDataset, args, device: str, run_dir: str) 
                 best_loss, best_state = history["loss"][-1], state_dict()
                 torch.save(best_state, os.path.join(run_dir, "best.pt"))
 
-        if step % args.sample_every == 0 or step == args.steps or user_stop:
+        if step % args.sample_every == 0 or final or user_stop:
             text = generate(model, data, args.prompt, args.sample_chars, args.block_size,
-                            args.temperature, device)
+                            args.temperature, device, amp)
             print(f"--- sample @ step {step} ---\n{text}\n---", flush=True)
             with open(samples_path, "a") as f:
                 f.write(f"=== step {step} ===\n{text}\n\n")
 
-        if step % args.checkpoint_every == 0 or step == args.steps or user_stop:
+        if step % args.checkpoint_every == 0 or final or user_stop:
             torch.save(state_dict(), os.path.join(ckpt_dir, f"checkpoint_step{step:06d}.pt"))
+        if step % args.save_every == 0 or final or user_stop or signal_stop:
+            save_last(step)
+        if cooldown_end is not None and step >= cooldown_end:
+            print(f"cooldown finished at step {step}", flush=True)
+            break
         if user_stop:
-            print(f"stopped at step {step} (STOP file)")
+            print(f"stopped at step {step} (STOP file); resume with --resume", flush=True)
             os.remove(stop_file)
+            break
+        if signal_stop:
+            print(f"stopped at step {step} (signal {signal_stop[0]}); saved {last_path}, resume with --resume",
+                  flush=True)
             break
 
     history["final_state"] = best_state  # save_run writes this as best.pt
@@ -219,6 +317,10 @@ def train(model: nn.Module, data: CharDataset, args, device: str, run_dir: str) 
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--data_path", type=str, default=DEFAULT_PATH)
+    parser.add_argument("--val_fraction", type=float, default=0.1,
+                        help="share of the text used for validation (text8 standard: 0.05)")
+    parser.add_argument("--test_fraction", type=float, default=0.0,
+                        help="share held out at the end as a test split (text8 standard: 0.05)")
     parser.add_argument("--block_size", type=int, default=128, help="context length in characters")
 
     parser.add_argument("--dim", type=int, default=128)
@@ -228,6 +330,12 @@ def main():
                         help="spiking simulation time steps (power of two for the integer model)")
     parser.add_argument("--attn_lif", action=argparse.BooleanOptionalAction, default=True,
                         help="LIF on the attention output before proj (binary proj input)")
+    parser.add_argument("--head_scale", action=argparse.BooleanOptionalAction, default=False,
+                        help="one learned attention scale per head instead of per block (needs --learnable_scale)")
+    parser.add_argument("--head_norm", action=argparse.BooleanOptionalAction, default=False,
+                        help="attention L1 norm per head (mean/MAD over each head's features) instead of shared")
+    parser.add_argument("--attn_norm_eps", type=float, default=1e-6,
+                        help="constant added to the attention norm's MAD (e.g. 0.0625 with --head_norm)")
     parser.add_argument("--learnable_scale", action=argparse.BooleanOptionalAction, default=True,
                         help="learn the attention scale (2^s per block, init 1/8) instead of fixed 1/8")
     parser.add_argument("--pos_embed", choices=("learned", "sinusoid"), default="learned",
@@ -257,30 +365,59 @@ def main():
     parser.add_argument("--adaptive_clip", type=float, default=0.0,
                         help="per-block clipping: cut a block's gradient norm to this many times its running "
                              "average (e.g. 3); 0 = off. See health.AdaptiveClipper")
+    parser.add_argument("--homeostasis", type=float, default=0.0,
+                        help="target firing rate for the Q/K/V homeostatic bias rule (e.g. 0.01); 0 = off. "
+                             "See health.Homeostasis")
+    parser.add_argument("--homeo_upper", type=float, default=0.0,
+                        help="with --homeostasis: also push down Q/K/V features firing above this rate "
+                             "(e.g. 0.5); 0 = push up only")
+    parser.add_argument("--homeo_units", type=str, default="qkv",
+                        help="NL units the homeostatic rule regulates: comma list of qkv, attn")
+    parser.add_argument("--homeo_eta", type=float, default=1e-3,
+                        help="largest bias increase per step for a silent Q/K/V feature")
     parser.add_argument("--grad_clip", type=float, default=0.0,
                         help="clip the global grad norm (default 0 = off: surrogate-gradient norms reach "
                              "~1e10 at init, so a small clip freezes the head; Adam copes with the scale)")
 
     parser.add_argument("--sample_every", type=int, default=1000)
     parser.add_argument("--sample_chars", type=int, default=300)
-    parser.add_argument("--prompt", type=str, default="\n")
+    parser.add_argument("--prompt", type=str, default=None,
+                        help="sampling prompt (default: newline, or a space if the corpus has no newline)")
     parser.add_argument("--temperature", type=float, default=0.8)
 
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--device", type=str, default=None)
     parser.add_argument("--run_suffix", type=str, default="", help="appended to the run directory name")
+    parser.add_argument("--cooldown", type=int, default=0,
+                        help="with --resume (e.g. of a constant-lr run): decay the lr from --lr to lr/10 with a "
+                             "cosine over this many steps from the resume point, then stop")
+    parser.add_argument("--resume", action="store_true",
+                        help="continue this run (same flags) from RUN_DIR/last.pt: weights, optimizer, step, "
+                             "clipper / homeostasis state, history and RNG, as if it had never stopped")
+    parser.add_argument("--save_every", type=int, default=500,
+                        help="write the full training state to RUN_DIR/last.pt every this many steps")
+    parser.add_argument("--bf16", action=argparse.BooleanOptionalAction, default=False,
+                        help="bf16 autocast for forward passes (about 1.3x faster, half the activation memory)")
+    parser.add_argument("--compile", action=argparse.BooleanOptionalAction, default=False,
+                        help="torch.compile the training forward (about 1.8x faster; ~10 s compile at start)")
     parser.add_argument("--init_from", type=str, default="",
                         help="state_dict (.pt, e.g. a run's best.pt) to start from; the model flags must match it")
     args = parser.parse_args()
     assert args.batch_size % args.grad_accum == 0, "batch_size must be divisible by grad_accum"
 
     torch.manual_seed(args.seed)
+    torch.backends.cuda.matmul.allow_tf32 = True  # TF32 matmuls on Ampere+: faster, loss unchanged
+    torch.backends.cudnn.allow_tf32 = True
     device = args.device or pick_device()
-    data = CharDataset(args.data_path)
+    data = CharDataset(args.data_path, args.val_fraction, args.test_fraction)
+    if args.prompt is None:
+        args.prompt = "\n" if "\n" in data.stoi else " "
     print(f"device: {device}, vocab_size={data.vocab_size}, "
           f"train chars={len(data.splits['train']):,}, val chars={len(data.splits['val']):,}")
 
-    run_name = f"char_{args.dim}d{args.depth}L_T{args.T}"
+    corpus = os.path.basename(os.path.dirname(os.path.abspath(args.data_path)))
+    prefix = "char" if corpus == "tinyshakespeare" else corpus  # e.g. text8_512d4L_T8
+    run_name = f"{prefix}_{args.dim}d{args.depth}L_T{args.T}"
     if args.run_suffix:
         run_name += f"_{args.run_suffix}"
     run_dir = os.path.join("runs", run_name)
@@ -296,12 +433,19 @@ def main():
                                T=args.T, max_len=args.block_size, attn_lif=args.attn_lif,
                                pow2_gamma=args.pow2_gamma, attn_proj=args.attn_proj,
                                mlp_layers=args.mlp_layers, attn_norm=args.attn_norm,
-                               pos_embed=args.pos_embed, learnable_scale=args.learnable_scale)
+                               pos_embed=args.pos_embed, learnable_scale=args.learnable_scale,
+                               head_scale=args.head_scale, head_norm=args.head_norm,
+                               attn_norm_eps=args.attn_norm_eps)
     print(f"SpikingTransformer params: {sum(p.numel() for p in model.parameters()):,}")
-    if args.init_from:
+    if args.init_from and not args.resume:
         # weights only: the optimizer state is not saved, so Adam restarts its
         # statistics (use a short --warmup_steps when resuming)
-        model.load_state_dict(torch.load(args.init_from, map_location="cpu"))
+        state = torch.load(args.init_from, map_location="cpu")
+        own = model.state_dict()
+        for k, v in state.items():  # a per-block scale seeds every head's scale (--head_scale)
+            if k.endswith("log2_scale") and v.dim() == 0 and own[k].dim() == 1:
+                state[k] = v.expand_as(own[k]).clone()
+        model.load_state_dict(state)
         print(f"initialised weights from {args.init_from}")
 
     history = train(model, data, args, device, run_dir)

@@ -16,6 +16,16 @@ default, so older checkpoints behave as trained):
   saturating on large overlap counts. Requires attn_lif.
 - learnable_scale: the attention scale is a learned scalar per block,
   2^log2_scale (initialised to 1/8), instead of the fixed 1/8.
+- head_scale: with learnable_scale, one learned scale per head instead of per
+  block. Under a shared attn_norm a per-block scale cancels out, but per-head
+  scales change how loud each head is inside the shared normalisation.
+- head_norm: attn_norm takes its mean and MAD over each head's features
+  separately, so a head with large overlap counts cannot shrink the others
+  below the LIF threshold.
+- attn_norm_eps: the constant added to attn_norm's MAD (default 1e-6). A
+  per-head MAD over only head_dim features can be tiny for a nearly constant
+  head; a larger floor (e.g. 1/16) keeps such heads quiet instead of blowing
+  their noise (and their gradients) up to full size.
 - attn_proj=False: drop proj (and its norm and LIF) entirely; the attention
   LIF's spikes go straight into the residual sum and on to the MLP. Requires
   attn_lif.
@@ -46,10 +56,13 @@ class L1LayerNorm(nn.Module):
     """
 
     def __init__(self, dim: int, eps: float = 1e-6, table_len: int = None,
-                 pow2_gamma: bool = False):
+                 pow2_gamma: bool = False, groups: int = 1):
         super().__init__()
+        assert dim % groups == 0, "dim must be divisible by groups"
+        assert groups == 1 or table_len is None, "the per-position MAD table supports groups=1 only"
         self.eps = eps
         self.pow2_gamma = pow2_gamma
+        self.groups = groups  # > 1: mean and MAD per group of dim // groups features (e.g. per head)
         self.weight = nn.Parameter(torch.ones(dim))
         self.bias = nn.Parameter(torch.zeros(dim))
         self.use_table = table_len is not None
@@ -57,6 +70,11 @@ class L1LayerNorm(nn.Module):
             self.register_buffer("mad_table", torch.ones(table_len))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if self.groups > 1:
+            g = x.view(*x.shape[:-1], self.groups, -1)
+            g = g - g.mean(dim=-1, keepdim=True)
+            g = g / (g.abs().mean(dim=-1, keepdim=True) + self.eps)
+            return g.reshape(x.shape) * self.gamma() + self.bias
         x_centered = x - x.mean(dim=-1, keepdim=True)
         if self.use_table:
             mad = self.mad_table[: x.shape[-2], None]  # (L, 1), broadcast over batch and features
@@ -77,7 +95,8 @@ class L1LayerNorm(nn.Module):
 class SpikingSelfAttention(nn.Module):
     def __init__(self, dim: int, num_heads: int, qkv_bias: bool = False,
                  table_len: int = None, attn_lif: bool = False, pow2_gamma: bool = False,
-                 attn_proj: bool = True, attn_norm: bool = False, learnable_scale: bool = False):
+                 attn_proj: bool = True, attn_norm: bool = False, learnable_scale: bool = False,
+                 head_scale: bool = False, head_norm: bool = False, attn_norm_eps: float = 1e-6):
         super().__init__()
         assert attn_lif or not attn_norm, "attn_norm feeds attn_lif"
         assert dim % num_heads == 0, "dim must be divisible by num_heads"
@@ -86,7 +105,11 @@ class SpikingSelfAttention(nn.Module):
         self.num_heads = num_heads
         self.head_dim = dim // num_heads
         self.scale = 0.125  # fixed scale, as in Spikformer (inputs are already unit-scale spikes)
-        self.log2_scale = nn.Parameter(torch.tensor(-3.0)) if learnable_scale else None
+        assert learnable_scale or not head_scale, "head_scale needs learnable_scale"
+        assert attn_norm or not head_norm, "head_norm needs attn_norm"
+        self.log2_scale = None
+        if learnable_scale:  # 2^s: one per block, or one per head with head_scale
+            self.log2_scale = nn.Parameter(torch.full((num_heads,) if head_scale else (), -3.0))
 
         self.q_linear = nn.Linear(dim, dim, bias=qkv_bias)
         self.q_norm = L1LayerNorm(dim, table_len=table_len, pow2_gamma=pow2_gamma)
@@ -100,7 +123,8 @@ class SpikingSelfAttention(nn.Module):
         self.v_norm = L1LayerNorm(dim, table_len=table_len, pow2_gamma=pow2_gamma)
         self.v_lif = LIFNeuron()
 
-        self.attn_norm = L1LayerNorm(dim, table_len=table_len, pow2_gamma=pow2_gamma) if attn_norm else None
+        self.attn_norm = (L1LayerNorm(dim, eps=attn_norm_eps, table_len=table_len, pow2_gamma=pow2_gamma,
+                                      groups=num_heads if head_norm else 1) if attn_norm else None)
         self.attn_lif = LIFNeuron() if attn_lif else None
 
         if attn_proj:
@@ -135,6 +159,8 @@ class SpikingSelfAttention(nn.Module):
             # plain zero-out rather than the -inf used before a softmax
             attn = attn.masked_fill(attn_mask, 0.0)
         scale = self.scale if self.log2_scale is None else torch.pow(2.0, self.log2_scale)
+        if torch.is_tensor(scale) and scale.dim() == 1:
+            scale = scale.view(-1, 1, 1)        # per head, broadcast over (L, head_dim)
         out = (attn @ v) * scale                # (B, H, L, head_dim)
         out = out.transpose(1, 2).reshape(B, L, D)
         if self.attn_norm is not None:
@@ -183,11 +209,13 @@ class SpikingMLP(nn.Module):
 class SpikingBlock(nn.Module):
     def __init__(self, dim: int, num_heads: int, mlp_ratio: int = 4, table_len: int = None,
                  attn_lif: bool = False, pow2_gamma: bool = False, attn_proj: bool = True,
-                 mlp_layers: int = 2, attn_norm: bool = False, learnable_scale: bool = False):
+                 mlp_layers: int = 2, attn_norm: bool = False, learnable_scale: bool = False,
+                 head_scale: bool = False, head_norm: bool = False, attn_norm_eps: float = 1e-6):
         super().__init__()
         self.attn = SpikingSelfAttention(dim, num_heads, table_len=table_len, attn_lif=attn_lif,
                                          pow2_gamma=pow2_gamma, attn_proj=attn_proj, attn_norm=attn_norm,
-                                         learnable_scale=learnable_scale)
+                                         learnable_scale=learnable_scale, head_scale=head_scale,
+                                         head_norm=head_norm, attn_norm_eps=attn_norm_eps)
         self.mlp = SpikingMLP(dim, dim * mlp_ratio, table_len=table_len, pow2_gamma=pow2_gamma,
                               layers=mlp_layers)
 

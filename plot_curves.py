@@ -7,7 +7,7 @@ loss (faint), log scale.
 For runs that log training-health metrics (train_char.py, see health.py), one
 panel per metric follows, in a two-column grid: firing rate, never-fired and
 saturated features, surrogate gradient, learning rate, gradient norm, update/weight ratio,
-norm gain, attention scale, empty attention rows, attention spread, attention
+norm gain, attention scale and per-head scale spread, dead heads, empty attention rows, attention spread, attention
 on the last 8 positions, context gain, and (with adaptive clipping) the share of
 steps clipped and the largest gradient spike. Per-LIF metrics are averaged per
 block; colour = block, line style = run.
@@ -42,11 +42,22 @@ HEALTH = [
     ("grad_norm", "gradient norm", False, False, True, None),
     ("update_ratio", "update / weight norm per step", False, False, True, None),
     ("norm_gain", "mean |L1 norm gain|", False, False, False, None),
+    ("gamma_min", "min L1 norm gain (gamma) per block", False, False, False, None),
+    ("gamma_max", "max L1 norm gain (gamma) per block", False, False, False, None),
+    ("beta_min", "min L1 norm bias (beta) per block", False, False, False, None),
+    ("beta_max", "max L1 norm bias (beta) per block", False, False, False, None),
     ("attn_scale", "SSA attention scale 2^s", False, False, True, None),
+    ("head_scale_spread", "largest / smallest head scale", False, False, True, None),
+    ("attn_dead_heads", "dead heads, attention LIF < 0.5% (%)", False, True, False, (0, 100)),
     ("attn_empty", "query rows with no Q.K overlap (%)", False, True, False, (0, 100)),
     ("attn_entropy", "attention spread (1 = uniform)", False, False, False, (0, 1)),
     ("attn_local", "attention on last 8 positions (%)", False, True, False, (0, None)),
     ("context_gain", "context gain: loss(self only) - loss (nats)", False, False, False, None),
+    ("homeo_active", "Q/K/V features below target rate (%)", False, True, False, (0, 100)),
+    ("homeo_high", "Q/K/V features above upper target (%)", False, True, False, (0, 100)),
+    ("homeo_shift", "mean Q/K/V norm bias shift", False, False, False, None),
+    ("homeo_shift_up", "Q/K/V bias raised (mean over features)", False, False, False, None),
+    ("homeo_shift_down", "Q/K/V bias lowered (mean over features)", False, False, False, None),
     ("clip_frac", "steps clipped since last eval (%)", False, True, False, (0, None)),
     ("grad_spike", "largest gradient / running average", False, False, True, None),
 ]
@@ -100,8 +111,20 @@ def main() -> None:
         raise SystemExit(f"no run updated in the last {args.minutes:g} minutes; name runs explicitly")
 
     histories = {run: json.load(open(os.path.join(args.runs_dir, run, "live.json"))) for run in runs}
-    panels = [p for p in HEALTH if any(h.get(p[0]) for h in histories.values())]
-    rows = 1 + math.ceil(len(panels) / 2)
+    for h in histories.values():  # derived: steps per second between evaluations (wall clock)
+        if len(h.get("time", [])) == len(h["step"]):
+            h["steps_per_s"] = [(s - (h["step"][i - 1] if i else 0)) / max(t - (h["time"][i - 1] if i else 0), 1e-9)
+                                for i, (s, t) in enumerate(zip(h["step"], h["time"]))]
+    def scale_fixed(field):  # attention-scale panels are skipped when the scale is not learnable
+        if field not in ("attn_scale", "head_scale_spread"):
+            return False
+        values = [x for h in histories.values() if h.get(field)
+                  for v in (per_block(h[field]).values()) for x in v]
+        return len(set(values)) <= 1
+
+    panels = [p for p in HEALTH if any(h.get(p[0]) for h in histories.values()) and not scale_fixed(p[0])]
+    has_bpc = any(any(k.startswith("bpc_T") for k in h) for h in histories.values())
+    rows = 1 + math.ceil((len(panels) + has_bpc) / 2)
     fig, axes = plt.subplots(rows, 2, figsize=(14, 3.2 * rows), squeeze=False)
     colors = plt.rcParams["axes.prop_cycle"].by_key()["color"]
 
@@ -118,11 +141,12 @@ def main() -> None:
 
         i = -1
         latest = ", ".join(f"T={T} {h[f'acc_T{T}'][i] * 100:.1f}%" for T in Ts)
-        print(f"{run}: step {h['step'][i]}, {h['time'][i] / 60:.0f} min, {latest}, eval loss {h[f'loss_T{Tm}'][i]:.3f}")
+        speed = f", {h['steps_per_s'][i]:.2f} steps/s" if "steps_per_s" in h else ""
+        print(f"{run}: step {h['step'][i]}, {h['time'][i] / 60:.0f} min{speed}, {latest}, eval loss {h[f'loss_T{Tm}'][i]:.3f}")
         print("   every 1,000 steps (step, accuracy %, loss):",
               [(s, round(a * 100, 1), round(l, 2)) for s, a, l in zip(h["step"], h[f"acc_T{Tm}"], h[f"loss_T{Tm}"])
                if s % 1000 == 0])
-    acc_ax.set_title("accuracy (%) (recall / next char)", fontsize=9); acc_ax.set_ylim(0, 100)
+    acc_ax.set_title("accuracy (%) (recall / next char)", fontsize=9)  # y range follows the data
     loss_ax.set_title("loss (log scale)", fontsize=9); loss_ax.set_yscale("log")
     for ax in (acc_ax, loss_ax):
         ax.legend(fontsize=7)
@@ -130,7 +154,18 @@ def main() -> None:
     health_runs = [run for run in runs if any(histories[run].get(p[0]) for p in HEALTH)]
     styles = dict(zip(health_runs, ("-", "--", ":", "-.")))
     flat = [ax for row in axes[1:] for ax in row]
-    for ax, (field, title, _, pct, log, ylim) in zip(flat, panels):
+    if has_bpc:  # bits per character: val at each eval T (solid / dashed), train loss / ln 2 (faint)
+        bpc_ax, flat = flat[0], flat[1:]
+        for color, run in zip(colors, runs):
+            h = histories[run]
+            for T, ls in zip(sorted(int(k[5:]) for k in h if k.startswith("bpc_T")), ("-", "--", ":", "-.")):
+                bpc_ax.plot(h["step"], h[f"bpc_T{T}"], color=color, lw=1.3, ls=ls, label=f"{run}, T={T}")
+            if "bpc" in h:
+                bpc_ax.plot(h["step"], [l / math.log(2) for l in h["train_loss"]], color=color, lw=0.8, alpha=0.4,
+                            label=f"{run}, train")
+        bpc_ax.set_title("bits per character (val; train faint)", fontsize=9)
+        bpc_ax.legend(fontsize=6, ncol=2)
+    for ax, (field, title, _, pct, log, _ylim) in zip(flat, panels):  # y range follows the data
         for run in health_runs:
             h = histories[run]
             if not h.get(field):
@@ -142,10 +177,12 @@ def main() -> None:
                 ax.plot(steps, [k * v for v in values], color=GROUP_COLORS.get(g, "C0"), ls=styles[run],
                         lw=1.2, label=label)
         ax.set_title(title, fontsize=9)
+        if field == "fire_rate":
+            ax.set_ylim(0, 100)  # firing rate always on the full 0-100% axis
+        if field in ("fire_dead", "fire_sat") and ax.lines and max(max(l.get_ydata()) for l in ax.lines) < 10:
+            ax.set_ylim(0, 10)  # 0-10% axis while every value is below 10%, adaptive above that
         if log:
             ax.set_yscale("log")
-        if ylim:
-            ax.set_ylim(*ylim)
         ax.legend(fontsize=6, ncol=3)
     for ax in flat[len(panels):]:
         ax.axis("off")

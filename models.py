@@ -60,7 +60,8 @@ class SpikingTransformer(nn.Module):
                  num_heads: int = 4, T: int = 32, max_len: int = 64,
                  norm_table: bool = False, attn_lif: bool = False, pow2_gamma: bool = False,
                  attn_proj: bool = True, mlp_layers: int = 2, attn_norm: bool = False,
-                 pos_embed: str = "learned", learnable_scale: bool = False, mask_round_len: int = 0):
+                 pos_embed: str = "learned", learnable_scale: bool = False, mask_round_len: int = 0,
+                 head_scale: bool = False, head_norm: bool = False, attn_norm_eps: float = 1e-6):
         super().__init__()
         self.T = T
         self.mask_round_len = mask_round_len  # > 0: attention may only look at positions < this
@@ -79,7 +80,8 @@ class SpikingTransformer(nn.Module):
         self.blocks = nn.ModuleList([
             SpikingBlock(dim, num_heads, table_len=table_len, attn_lif=attn_lif,
                          pow2_gamma=pow2_gamma, attn_proj=attn_proj, mlp_layers=mlp_layers,
-                         attn_norm=attn_norm, learnable_scale=learnable_scale)
+                         attn_norm=attn_norm, learnable_scale=learnable_scale,
+                         head_scale=head_scale, head_norm=head_norm, attn_norm_eps=attn_norm_eps)
             for _ in range(depth)
         ])
         self.head = nn.Linear(dim, vocab_size)
@@ -139,4 +141,6 @@ def model_from_config(config: dict, max_len: int) -> SpikingTransformer:
         mlp_layers=config.get("mlp_layers", 2), attn_norm=config.get("attn_norm", False),
         pos_embed=config.get("pos_embed", "learned"), learnable_scale=config.get("learnable_scale", False),
         mask_round_len=2 * config["num_kv_pairs"] if config.get("mask_round1") else 0,  # AR runs only
+        head_scale=config.get("head_scale", False), head_norm=config.get("head_norm", False),
+        attn_norm_eps=config.get("attn_norm_eps", 1e-6),
     )
