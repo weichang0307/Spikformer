@@ -1,5 +1,6 @@
 """SpikingTransformer: Spikformer-style Spiking Self Attention (SSA) model for
-the (causal) Associative Recall task, built by simulating `SpikingBlock`s for
+causal next-token prediction (the Associative Recall task in train.py, or
+character-level language modelling in train_char.py), built by simulating `SpikingBlock`s for
 T discrete time steps and rate-decoding the output (mean spike count over T).
 L1LayerNorm is used throughout. The combined token and positional embeddings
 are normalized and fed as a constant current into an input LIF neuron
@@ -98,10 +99,12 @@ class SpikingTransformer(nn.Module):
         for blk in self.blocks:
             blk.reset_state()
 
-    def forward(self, tokens: torch.Tensor, return_attn: bool = False):
+    def forward(self, tokens: torch.Tensor, return_attn: bool = False, attn_mask: torch.Tensor = None):
+        """attn_mask: optional (L, L) bool mask (True = masked) replacing the causal one,
+        e.g. the identity complement to measure how much the model uses its context."""
         B, L = tokens.shape
         x0 = self.input_norm(self.embed(tokens) + self.pos_embed[:, :L])
-        causal_mask = attention_mask(L, self.mask_round_len, tokens.device)
+        causal_mask = attn_mask if attn_mask is not None else attention_mask(L, self.mask_round_len, tokens.device)
 
         self.reset_state()
         acc = 0.0
@@ -127,12 +130,13 @@ class SpikingTransformer(nn.Module):
 
 def model_from_config(config: dict, max_len: int) -> SpikingTransformer:
     """The SpikingTransformer a run's config.json describes (weights not loaded)."""
+    vocab = config["vocab_size"] if "vocab_size" in config else config["num_keys"] + config["num_values"]
     return SpikingTransformer(
-        config["num_keys"] + config["num_values"], dim=config["dim"], depth=config["depth"],
+        vocab, dim=config["dim"], depth=config["depth"],
         num_heads=config["num_heads"], T=config["T"], max_len=max_len,
         norm_table=config.get("norm_table", False), attn_lif=config.get("attn_lif", False),
         pow2_gamma=config.get("pow2_gamma", False), attn_proj=config.get("attn_proj", True),
         mlp_layers=config.get("mlp_layers", 2), attn_norm=config.get("attn_norm", False),
         pos_embed=config.get("pos_embed", "learned"), learnable_scale=config.get("learnable_scale", False),
-        mask_round_len=2 * config["num_kv_pairs"] if config.get("mask_round1") else 0,
+        mask_round_len=2 * config["num_kv_pairs"] if config.get("mask_round1") else 0,  # AR runs only
     )

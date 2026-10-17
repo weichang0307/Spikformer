@@ -14,27 +14,57 @@
          font: 14px/1.4 system-ui, -apple-system, "Segoe UI", sans-serif; }
   header { display: flex; align-items: baseline; gap: 12px; flex-wrap: wrap; margin-bottom: 12px; }
   h1 { font-size: 18px; margin: 0; }
+  h3 { font-size: 13px; margin: 12px 0 4px; color: var(--muted); font-weight: 600; }
   .muted { color: var(--muted); }
   .grid { display: grid; gap: 12px; grid-template-columns: repeat(auto-fit, minmax(360px, 1fr)); }
-  .card { background: var(--card); border: 1px solid var(--border); border-radius: 10px; padding: 12px; }
+  .card { background: var(--card); border: 1px solid var(--border); border-radius: 10px; padding: 12px; min-width: 0; }
   .card h2 { font-size: 15px; margin: 0 0 4px; }
   .stats { font-variant-numeric: tabular-nums; margin-bottom: 8px; }
   .stats b { font-weight: 600; }
-  .charts { display: grid; gap: 8px; }
+  .charts { display: grid; gap: 8px; grid-template-columns: repeat(auto-fit, minmax(320px, 1fr)); }
+  .charts > div { min-width: 0; }
   canvas { width: 100% !important; height: 220px !important; }
-  .stale { color: #d0703a; }
+  pre.sample { margin: 8px 0 0; padding: 8px; max-height: 220px; overflow: auto; white-space: pre-wrap;
+               background: var(--bg); border: 1px solid var(--border); border-radius: 6px; font-size: 12px; }
+  @media (max-width: 420px) { body { padding: 8px; } .grid, .charts { grid-template-columns: 1fr; } }
 </style>
 </head>
 <body>
 <header>
   <h1>Training Monitor</h1>
-  <span class="muted">Refreshes every 5 s. Stop a run: <code>touch runs/&lt;run&gt;/STOP</code></span>
+  <span class="muted">Refreshes every 5 s. <code>?runs=a,b</code> picks runs. Stop a run: <code>touch runs/&lt;run&gt;/STOP</code></span>
 </header>
 <div class="grid" id="grid"></div>
 <script>
 const params = new URLSearchParams(location.search);
-const RUNS = (params.get("runs") || "spike_8_32_32_T16,spike_12_32_32_T16,spike_16_32_32_T16").split(",");
+const RUNS = (params.get("runs") || "char_512d4L_T16_proj_nwd").split(",");
 const COLORS = { train: "#9a9aa0", 4: "#e0803a", 8: "#3a8ee0", 16: "#2fa86b", 32: "#a35cd6" };
+const GROUP_COLORS = { input: "#9a9aa0", head: "#8a6d3b", "block 0": "#e0803a", "block 1": "#3a8ee0",
+                       "block 2": "#2fa86b", "block 3": "#a35cd6", "block 4": "#d64f7a", "block 5": "#3ab0b0" };
+
+// Training-health panels (fields written by health.py via train_char.py).
+// perLIF: values keyed by LIF name, averaged per block; pct: plot as %; log: log y axis.
+const HEALTH = [
+  { section: "Spiking activity (val set, training T)" },
+  { field: "fire_rate", title: "LIF firing rate (%)", perLIF: true, pct: true, min: 0 },
+  { field: "fire_dead", title: "never-fired features (%)", perLIF: true, pct: true, min: 0, max: 100 },
+  { field: "fire_sat", title: "saturated features, rate ≥ 90% (%)", perLIF: true, pct: true, min: 0 },
+  { field: "surrogate", title: "mean surrogate gradient (peak 0.5)", perLIF: true, min: 0 },
+  { section: "Optimisation" },
+  { field: "lr", title: "learning rate (log)", scalar: true, log: true },
+  { field: "grad_norm", title: "gradient norm (log)", log: true },
+  { field: "update_ratio", title: "update / weight norm per step (log)", log: true },
+  { field: "norm_gain", title: "mean |L1 norm gain|", min: 0 },
+  { field: "attn_scale", title: "SSA attention scale 2^s (log)", log: true },
+  { section: "Attention and context use" },
+  { field: "attn_empty", title: "query rows with no Q·K overlap (%)", pct: true, min: 0, max: 100 },
+  { field: "attn_entropy", title: "attention spread (1 = uniform over context)", min: 0, max: 1 },
+  { field: "attn_local", title: "attention on last 8 positions (%)", pct: true, min: 0 },
+  { field: "context_gain", title: "context gain: loss(self only) − loss (nats)", scalar: true },
+  { section: "Adaptive gradient clipping" },
+  { field: "clip_frac", title: "steps clipped since last eval (%)", pct: true, min: 0 },
+  { field: "grad_spike", title: "largest gradient / running average (log)", log: true },
+];
 const charts = {};
 
 function makeChart(canvas, yLabel, yMin, yMax, yType = "linear") {
@@ -42,7 +72,7 @@ function makeChart(canvas, yLabel, yMin, yMax, yType = "linear") {
     type: "line",
     data: { datasets: [] },
     options: {
-      animation: false, parsing: false, normalized: true,
+      animation: false, parsing: false, normalized: true, maintainAspectRatio: false,
       scales: {
         x: { type: "linear", title: { display: true, text: "step" } },
         y: { type: yType, min: yMin, max: yMax, title: { display: true, text: yLabel } },
@@ -55,16 +85,75 @@ function makeChart(canvas, yLabel, yMin, yMax, yType = "linear") {
 
 function series(h, key) { return h.step.map((s, i) => ({ x: s, y: h[key][i] })); }
 
+function groupOf(name) {
+  const m = name.match(/^blocks\.(\d+)\./);
+  return m ? `block ${m[1]}` : name.startsWith("head") ? "head" : name.startsWith("block ") ? name : "input";
+}
+
+function groupOrder(a, b) {
+  const rank = g => g === "input" ? -1 : g === "head" ? 99 : +g.split(" ")[1];
+  return rank(a) - rank(b);
+}
+
+// one line per block; per-LIF fields are averaged over each block's LIFs
+function healthSeries(h, panel) {
+  const k = panel.pct ? 100 : 1;
+  if (panel.scalar) {
+    const v = h[panel.field];
+    return [{ label: "all", borderColor: "#3a8ee0",
+              data: v.map((y, j) => ({ x: h.step[j + h.step.length - v.length], y: k * y })) }];
+  }
+  const groups = {};
+  for (const [name, values] of Object.entries(h[panel.field])) (groups[groupOf(name)] ??= []).push(values);
+  return Object.keys(groups).sort(groupOrder).map(g => {
+    const lists = groups[g], n = Math.min(...lists.map(v => v.length));
+    const offset = h.step.length - n;
+    return {
+      label: g, borderColor: GROUP_COLORS[g] || "#888",
+      data: Array.from({ length: n }, (_, j) => ({
+        x: h.step[j + offset],
+        y: k * lists.reduce((sum, v) => sum + v[v.length - n + j], 0) / lists.length,
+      })),
+    };
+  });
+}
+
 for (const run of RUNS) {
   const card = document.createElement("div");
   card.className = "card";
   card.innerHTML = `<h2>${run}</h2><div class="stats" id="stats-${run}">waiting for live.json…</div>
-    <div class="charts"><canvas id="acc-${run}"></canvas><canvas id="loss-${run}"></canvas></div>`;
+    <div class="charts"><div><canvas id="acc-${run}"></canvas></div><div><canvas id="loss-${run}"></canvas></div></div>
+    <div id="health-${run}"></div>
+    <pre class="sample" id="sample-${run}" hidden></pre>`;
   document.getElementById("grid").appendChild(card);
   charts[run] = {
-    acc: makeChart(document.getElementById(`acc-${run}`), "recall accuracy", 0, 1),
+    acc: makeChart(document.getElementById(`acc-${run}`), "accuracy", 0, 1),
     loss: makeChart(document.getElementById(`loss-${run}`), "loss (log scale)", undefined, undefined, "logarithmic"),
+    health: null,
   };
+}
+
+// build the health panels the first time a run's live.json has them
+function buildHealth(run, h) {
+  const root = document.getElementById(`health-${run}`);
+  const made = {};
+  let box = null;
+  for (const panel of HEALTH) {
+    if (panel.section) {
+      root.insertAdjacentHTML("beforeend", `<h3>${panel.section}</h3>`);
+      box = document.createElement("div");
+      box.className = "charts";
+      root.appendChild(box);
+      continue;
+    }
+    if (!(panel.field in h)) continue;
+    const wrap = document.createElement("div");
+    const canvas = document.createElement("canvas");
+    wrap.appendChild(canvas);
+    box.appendChild(wrap);
+    made[panel.field] = makeChart(canvas, panel.title, panel.min, panel.max, panel.log ? "logarithmic" : "linear");
+  }
+  return made;
 }
 
 async function refresh() {
@@ -76,6 +165,12 @@ async function refresh() {
       h = await r.json();
     } catch { continue; }
     if (!h.step || !h.step.length) continue;
+    const charLM = "bpc" in h;  // train_char.py run: next-character accuracy and bits per char
+    if (charLM && !charts[run].charLM) {
+      charts[run].charLM = true;
+      charts[run].acc.options.scales.y.title.text = "next-char accuracy";
+      charts[run].loss.options.scales.y.title.text = "loss (nats/char, log scale)";
+    }
     const Ts = Object.keys(h).filter(k => k.startsWith("acc_T")).map(k => +k.slice(5)).sort((a, b) => a - b);
     for (const [metric, chart] of [["acc", charts[run].acc], ["loss", charts[run].loss]]) {
       chart.data.datasets = [
@@ -84,12 +179,31 @@ async function refresh() {
       ];
       chart.update();
     }
+    if (!charts[run].health && HEALTH.some(p => p.field && p.field in h)) charts[run].health = buildHealth(run, h);
+    for (const panel of HEALTH) {
+      const chart = charts[run].health && charts[run].health[panel.field];
+      if (!chart) continue;
+      chart.data.datasets = healthSeries(h, panel);
+      chart.update();
+    }
     const last = h.step.length - 1;
     const pct = v => (100 * v).toFixed(1) + "%";
     const minutes = (h.time[last] / 60).toFixed(1);
     document.getElementById(`stats-${run}`).innerHTML =
       `step <b>${h.step[last]}</b> · ${minutes} min · train <b>${pct(h.train_acc[last])}</b> · ` +
-      Ts.map(T => `T=${T} <b>${pct(h[`acc_T${T}`][last])}</b>`).join(" · ");
+      Ts.map(T => `T=${T} <b>${pct(h[`acc_T${T}`][last])}</b>` +
+                  (charLM ? ` / <b>${h[`bpc_T${T}`][last].toFixed(3)}</b> bpc` : "")).join(" · ") +
+      (charLM ? ` · best <b>${Math.min(...h.bpc).toFixed(3)}</b> bpc` : "");
+    if (charLM) {
+      try {
+        const r = await fetch(`runs/${run}/samples.txt?t=${Date.now()}`, { cache: "no-store" });
+        if (r.ok) {
+          const blocks = (await r.text()).split(/^=== /m).filter(b => b.trim());
+          const el = document.getElementById(`sample-${run}`);
+          if (blocks.length) { el.textContent = "=== " + blocks[blocks.length - 1].trimEnd(); el.hidden = false; }
+        }
+      } catch {}
+    }
   }
 }
 refresh();
