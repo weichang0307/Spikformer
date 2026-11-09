@@ -1,0 +1,240 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Spiking Folk Playground</title>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/abcjs@6.4.4/abcjs-audio.css">
+<script src="https://cdn.jsdelivr.net/npm/abcjs@6.4.4/dist/abcjs-basic-min.js"></script>
+<style>
+:root {
+  --bg: #f6f5f1; --panel: #ffffff; --ink: #1d1c1a; --muted: #6b6862; --line: #e2dfd8; --accent: #6d3fc0;
+  --ok: #1d7a46; --bad: #b3261e; --warn: #9a6400; --sheet: #ffffff; --chip: #f0eee8;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --bg: #161514; --panel: #201f1d; --ink: #ecebe7; --muted: #a3a09a; --line: #34322e; --accent: #b393f0;
+    --ok: #5cc48a; --bad: #f08a80; --warn: #e0b04a; --sheet: #f7f6f2; --chip: #2a2926;
+  }
+}
+:root[data-theme="dark"] {
+  --bg: #161514; --panel: #201f1d; --ink: #ecebe7; --muted: #a3a09a; --line: #34322e; --accent: #b393f0;
+  --ok: #5cc48a; --bad: #f08a80; --warn: #e0b04a; --sheet: #f7f6f2; --chip: #2a2926;
+}
+* { box-sizing: border-box; }
+body { margin: 0; background: var(--bg); color: var(--ink); font: 15px/1.45 system-ui, -apple-system, "Segoe UI", sans-serif; }
+header { padding: 20px 16px 8px; max-width: 1180px; margin: 0 auto; display: flex; gap: 12px; align-items: baseline; flex-wrap: wrap; }
+h1 { font-size: 22px; margin: 0; letter-spacing: -0.01em; }
+header p { margin: 0; color: var(--muted); flex: 1 1 320px; }
+main { max-width: 1180px; margin: 0 auto; padding: 8px 16px 40px; display: grid; grid-template-columns: 300px 1fr; gap: 16px; align-items: start; }
+@media (max-width: 860px) { main { grid-template-columns: 1fr; } }
+.panel { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 14px; }
+.controls { position: sticky; top: 12px; display: grid; gap: 12px; }
+@media (max-width: 860px) { .controls { position: static; } }
+label { display: grid; gap: 4px; font-size: 13px; color: var(--muted); }
+label b { color: var(--ink); font-weight: 600; }
+select, input[type=text], input[type=number], textarea {
+  width: 100%; font: inherit; color: var(--ink); background: var(--bg); border: 1px solid var(--line);
+  border-radius: 7px; padding: 7px 9px; min-width: 0;
+}
+textarea { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 13px; resize: vertical; }
+input[type=range] { width: 100%; accent-color: var(--accent); }
+.row { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+button { font: inherit; border: 1px solid var(--line); background: var(--chip); color: var(--ink); border-radius: 7px; padding: 7px 12px; cursor: pointer; }
+button.primary { background: var(--accent); color: #fff; border-color: transparent; font-weight: 600; padding: 10px; }
+button:disabled { opacity: .55; cursor: progress; }
+.hint { font-size: 12px; color: var(--muted); margin: 0; }
+.status { font-size: 13px; color: var(--muted); min-height: 1.4em; }
+.status.err { color: var(--bad); }
+.tunes { display: grid; gap: 16px; min-width: 0; }
+.empty { color: var(--muted); text-align: center; padding: 48px 16px; }
+.tune { display: grid; gap: 10px; min-width: 0; }
+.tune-head { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
+.tune-head h2 { font-size: 16px; margin: 0 8px 0 0; }
+.badge { font-size: 12px; padding: 2px 8px; border-radius: 99px; background: var(--chip); border: 1px solid var(--line); white-space: nowrap; }
+.badge.ok { color: var(--ok); } .badge.bad { color: var(--bad); } .badge.warn { color: var(--warn); }
+.sheet { background: var(--sheet); border-radius: 8px; padding: 6px; overflow-x: auto; color: #1d1c1a; }
+.sheet svg { max-width: 100%; height: auto; }
+.audio { min-height: 40px; }
+.tokens { display: flex; flex-wrap: wrap; gap: 3px; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12.5px; }
+.tok { padding: 1px 4px; border-radius: 4px; border: 1px solid transparent; cursor: default; }
+.tok.prefix { border-style: dashed; border-color: var(--line); color: var(--muted); }
+.tok.barline { font-weight: 700; }
+.tok.badbar { outline: 2px solid var(--bad); outline-offset: -1px; }
+.legend { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; font-size: 12px; color: var(--muted); }
+.ramp { width: 140px; height: 10px; border-radius: 3px; background: linear-gradient(90deg, rgba(214,69,65,.55), rgba(214,69,65,.0) 55%, rgba(60,160,100,.0) 70%, rgba(60,160,100,.35)); border: 1px solid var(--line); }
+details summary { cursor: pointer; color: var(--muted); font-size: 13px; }
+.abc-actions { display: flex; gap: 8px; margin-top: 6px; flex-wrap: wrap; }
+.theme { margin-left: auto; }
+</style>
+</head>
+<body>
+<header>
+  <h1>Spiking Folk Playground</h1>
+  <p>Generate Irish-style folk tunes with the spiking transformer (count² attention, T time steps of LIF spikes), see them as sheet music, play them, and check where the model was unsure.</p>
+  <button class="theme" id="theme" title="Switch light / dark">◐</button>
+</header>
+<main>
+  <section class="panel controls" aria-label="Generation settings">
+    <label><b>Model</b><select id="run"></select></label>
+    <div class="row">
+      <label><b>Meter</b><select id="meter"></select></label>
+      <label><b>Mode</b><select id="mode"></select></label>
+    </div>
+    <label><b>Opening (optional)</b>
+      <input type="text" id="opening" placeholder="e.g. |: G c c B c d" spellcheck="false" autocomplete="off">
+    </label>
+    <p class="hint">ABC tokens in C, L:1/8: notes c d e… (C, D, low; c' high), lengths 2 3 /2, bar lines | |: :| |1 |2, rhythm &gt; (3. The model continues from here.</p>
+    <label><b>Temperature</b> <span id="tempv">1.00</span>
+      <input type="range" id="temperature" min="0.3" max="1.5" step="0.05" value="1">
+    </label>
+    <label><b>Time steps T</b> <span id="tv">8</span> <span class="hint" id="tnote">(trained at 8)</span>
+      <input type="range" id="T" min="1" max="16" step="1" value="8">
+    </label>
+    <div class="row">
+      <label><b>Tunes</b><select id="n"><option>1</option><option selected>2</option><option>3</option><option>4</option></select></label>
+      <label><b>Seed</b><input type="number" id="seed" placeholder="random"></label>
+    </div>
+    <label><b>Top-k</b> <span class="hint">(0 = off)</span><input type="number" id="topk" value="0" min="0" max="135"></label>
+    <button class="primary" id="go">Generate</button>
+    <div class="status" id="status" role="status"></div>
+  </section>
+  <section class="tunes" id="tunes" aria-live="polite">
+    <div class="panel empty">Pick a meter and mode, then press <b>Generate</b>.</div>
+  </section>
+</main>
+<script>
+const $ = (id) => document.getElementById(id);
+const BARS = new Set(["|", "|:", ":|", "|1", "|2"]);
+let trainedT = 8, synths = [];
+
+function setTheme(t) {
+  if (t) document.documentElement.dataset.theme = t; else delete document.documentElement.dataset.theme;
+  try { t ? localStorage.setItem("folk-theme", t) : localStorage.removeItem("folk-theme"); } catch (e) {}
+}
+try { const t = localStorage.getItem("folk-theme"); if (t) setTheme(t); } catch (e) {}
+$("theme").onclick = () => {
+  const dark = document.documentElement.dataset.theme
+    ? document.documentElement.dataset.theme === "dark"
+    : matchMedia("(prefers-color-scheme: dark)").matches;
+  setTheme(dark ? "light" : "dark");
+};
+
+$("temperature").oninput = () => $("tempv").textContent = (+$("temperature").value).toFixed(2);
+$("T").oninput = () => $("tv").textContent = $("T").value;
+
+function status(msg, err) { $("status").textContent = msg; $("status").classList.toggle("err", !!err); }
+
+async function init() {
+  try {
+    const info = await (await fetch("/api/folk/info")).json();
+    $("meter").innerHTML = info.meters.map(m => `<option value="${m}" ${m === "M:6/8" ? "selected" : ""}>${m.slice(2)}</option>`).join("");
+    $("mode").innerHTML = info.modes.map(m => `<option value="${m}">C ${m.slice(3)}</option>`).join("");
+    const runs = await (await fetch("/api/runs")).json();
+    const byName = Object.fromEntries(runs.map(r => [r.name, r]));
+    $("run").innerHTML = info.runs.map(r => `<option value="${r}" ${r === info.default_run ? "selected" : ""}>${label(r)}</option>`).join("");
+    const pick = () => {
+      const r = byName[$("run").value];
+      trainedT = r ? r.T : 8;
+      $("T").value = trainedT; $("tv").textContent = trainedT;
+      $("tnote").textContent = r && r.name.includes("_ann_") ? "(ANN: ignored)" : `(trained at ${trainedT})`;
+    };
+    $("run").onchange = pick; pick();
+    status("Ready.");
+  } catch (e) { status("Could not reach the playground server: " + e, true); }
+}
+function label(r) {
+  if (r.includes("_ann_")) return "ANN teacher · " + r.replace("folkrnn_256d6L_", "");
+  return (r === "folkrnn_256d6L_T8_distill_homeo2s_sq8_spread8_50k_do05" ? "★ " : "") + r.replace("folkrnn_256d6L_", "").replace("distill_homeo2s_", "");
+}
+
+function probColor(p) {          // low probability -> red, high -> green, middle transparent
+  if (p == null) return "transparent";
+  if (p < 0.5) return `rgba(214,69,65,${(0.55 * (1 - p / 0.5)).toFixed(3)})`;
+  return `rgba(60,160,100,${(0.35 * (p - 0.5) / 0.5).toFixed(3)})`;
+}
+
+function badBarTokens(t) {        // indices of bar-line tokens closing a bar of the wrong length (not first/last)
+  const bad = new Set(), lens = t.bar_lengths, target = t.bar_target;
+  if (!target) return bad;
+  let bar = 0;
+  t.tokens.forEach((tok, i) => {
+    if (BARS.has(tok)) {
+      if (bar > 0 && bar < lens.length - 1 && lens[bar] != null && Math.abs(lens[bar] - target) > 1e-6) bad.add(i);
+      bar++;
+    }
+  });
+  return bad;
+}
+
+function render(tunes) {
+  synths.forEach(s => { try { s.pause(); } catch (e) {} });
+  synths = [];
+  const host = $("tunes"); host.innerHTML = "";
+  tunes.forEach((t, k) => {
+    const c = t.checks, card = document.createElement("article");
+    card.className = "panel tune";
+    const barPct = c.bars ? Math.round(100 * c.valid_bars / c.bars) : 0;
+    card.innerHTML = `
+      <div class="tune-head">
+        <h2>Tune ${k + 1}</h2>
+        <span class="badge ${barPct >= 90 ? "ok" : barPct >= 70 ? "warn" : "bad"}" title="bars whose length matches the meter (first and last bar skipped)">bars ${c.valid_bars}/${c.bars}</span>
+        <span class="badge ${c.repeats ? "ok" : "bad"}" title="as many :| as |:, and as many |2 as |1">repeats ${c.repeats ? "balanced" : "unbalanced"}</span>
+        <span class="badge ${c.tonic ? "ok" : "warn"}">${c.tonic ? "ends on C" : "does not end on C"}</span>
+        <span class="badge ${t.finished ? "ok" : "warn"}">${t.finished ? "finished" : "cut off at 600 tokens"}</span>
+        <span class="badge">${t.tokens.length} tokens</span>
+      </div>
+      <div class="sheet" id="sheet${k}"></div>
+      <div class="audio" id="audio${k}"></div>
+      <div class="legend"><span>token confidence:</span><span>unlikely</span><span class="ramp"></span><span>likely</span>
+        <span>· <span class="tok badbar">|</span> = bar of wrong length · dashed = your prompt</span></div>
+      <div class="tokens" id="toks${k}"></div>
+      <details><summary>ABC text (editable)</summary>
+        <textarea id="abc${k}" rows="6" spellcheck="false"></textarea>
+        <div class="abc-actions"><button data-k="${k}" class="rerender">Re-render</button><button data-k="${k}" class="copy">Copy ABC</button></div>
+      </details>`;
+    host.appendChild(card);
+    $("abc" + k).value = t.abc;
+    const bad = badBarTokens(t);
+    $("toks" + k).innerHTML = t.tokens.map((tok, i) => {
+      const p = t.prob[i], h = t.entropy[i];
+      const cls = ["tok", i < t.n_prefix ? "prefix" : "", BARS.has(tok) ? "barline" : "", bad.has(i) ? "badbar" : ""].join(" ");
+      const tip = i < t.n_prefix ? "your prompt" : `p = ${p.toFixed(3)} · entropy ${h.toFixed(2)} bits`;
+      return `<span class="${cls}" style="background:${probColor(p)}" title="${tip}">${tok.replace(/</g, "&lt;")}</span>`;
+    }).join("");
+    draw(k);
+  });
+  host.querySelectorAll(".rerender").forEach(b => b.onclick = () => draw(+b.dataset.k));
+  host.querySelectorAll(".copy").forEach(b => b.onclick = () => navigator.clipboard.writeText($("abc" + b.dataset.k).value).then(() => status("ABC copied.")));
+}
+
+function draw(k) {
+  const width = Math.min($("sheet" + k).clientWidth || 700, 1000);
+  const visual = ABCJS.renderAbc("sheet" + k, $("abc" + k).value, { responsive: "resize", staffwidth: width - 40, add_classes: true })[0];
+  if (!ABCJS.synth.supportsAudio()) { $("audio" + k).textContent = "Audio playback is not supported in this browser."; return; }
+  const ctl = new ABCJS.synth.SynthController();
+  ctl.load("#audio" + k, null, { displayLoop: true, displayRestart: true, displayPlay: true, displayProgress: true, displayWarp: false });
+  ctl.setTune(visual, false, { qpm: 110 }).catch(e => { $("audio" + k).textContent = "Audio could not load: " + e; });
+  synths[k] = ctl;
+}
+
+$("go").onclick = async () => {
+  $("go").disabled = true; status("Generating… (a few seconds per tune)");
+  const t0 = performance.now();
+  try {
+    const body = { run: $("run").value, ckpt: "best", meter: $("meter").value, mode: $("mode").value,
+      opening: $("opening").value, temperature: +$("temperature").value, top_k: +$("topk").value || 0,
+      T: +$("T").value, n: +$("n").value };
+    if ($("seed").value !== "") body.seed = +$("seed").value;
+    const res = await (await fetch("/api/folk/generate", { method: "POST", body: JSON.stringify(body) })).json();
+    if (res.error) throw new Error(res.error);
+    render(res.tunes);
+    status(`Generated ${res.tunes.length} tune${res.tunes.length > 1 ? "s" : ""} at T=${res.T} in ${((performance.now() - t0) / 1000).toFixed(1)} s.`);
+  } catch (e) { status(e.message || String(e), true); }
+  finally { $("go").disabled = false; }
+};
+$("opening").addEventListener("keydown", e => { if (e.key === "Enter") $("go").click(); });
+init();
+</script>
+</body>
+</html>

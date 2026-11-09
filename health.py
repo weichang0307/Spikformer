@@ -64,6 +64,8 @@ class LIFMonitor:
 
     def start(self):
         self.spikes, self.counts, self.surrogate = {}, {}, {}
+        for m in self.names:  # multi-step LIFs keep every step's potential for the surrogate statistic
+            m.record_v = True
         self.handles = [m.register_forward_hook(self._hook) for m in self.names]
 
     def _hook(self, module, inputs, spikes):
@@ -81,6 +83,8 @@ class LIFMonitor:
         for h in self.handles:
             h.remove()
         self.handles = []
+        for m in self.names:
+            m.record_v = False
         out = {"fire_rate": {}, "fire_dead": {}, "fire_sat": {}, "surrogate": {}}
         for n, total in self.spikes.items():
             per_feature = total / self.counts[n]
@@ -252,8 +256,9 @@ class AdaptiveClipper:
 
 
 class Homeostasis:
-    """Homeostatic bias rule for NL units of every block: Q, K, V (units "qkv")
-    and/or the attention NL (units "attn").
+    """Homeostatic bias rule for NL (L1LayerNorm -> LIF) units. `units` picks which:
+    "qkv" (Q, K, V of every block), "attn" (attention NL), "proj" (projection NL),
+    "mlp" (both MLP NLs), "input" (the input NL), or "all" for every NL unit.
 
     During training forward passes it keeps a running (EMA) firing rate for each
     feature of q_lif, k_lif and v_lif. After every optimizer step, each feature
@@ -263,7 +268,10 @@ class Homeostasis:
     firing above `upper` gets its bias lowered by
     eta * (rate - upper) / (1 - upper), pulling near-constant (saturated)
     features back into the informative range. Features inside the band are
-    left alone.
+    left alone. With `max_shift` > 0 each feature's cumulative shift is kept
+    within [-max_shift, max_shift] (anti-windup): a feature that cannot be
+    brought into the band within that range is left to the gradient instead of
+    being pushed until its bias alone decides whether it fires.
     This is a direct update, not a gradient: silent neurons sit far below
     threshold where the surrogate gradient is ~0, so the loss cannot revive them.
 
@@ -272,23 +280,34 @@ class Homeostasis:
     tokens, so a feature whose attention input is empty is not made to fire
     from its bias alone (activity that carries no information).
 
-    stats() returns per block the fraction of Q/K/V features below `target`
+    stats() returns per block the fraction of regulated features below `target`
     ("homeo_active"), above `upper` ("homeo_high"), and the mean bias shift so
     far ("homeo_shift").
     """
 
     def __init__(self, model: nn.Module, target: float = 0.01, eta: float = 1e-3, beta: float = 0.99,
-                 upper: float = 0.0, units: tuple = ("qkv",)):
+                 upper: float = 0.0, units: tuple = ("qkv",), max_shift: float = 0.0):
         self.target, self.eta, self.beta, self.upper = target, eta, beta, upper
-        self.units = []  # (block, lif, norm)
+        self.max_shift = max_shift
+        if "all" in units:
+            units = ("input", "qkv", "attn", "proj", "mlp")
+        self.units = []  # (group, lif, norm), group = "input" or "block i"
         gated = []       # norms whose push up needs a non-empty input (the attention NL)
+        if "input" in units:
+            self.units.append(("input", model.input_lif, model.input_norm))
         for i, blk in enumerate(model.blocks):
-            a = blk.attn
+            a, g = blk.attn, f"block {i}"
             if "qkv" in units:
-                self.units += [(i, a.q_lif, a.q_norm), (i, a.k_lif, a.k_norm), (i, a.v_lif, a.v_norm)]
+                self.units += [(g, a.q_lif, a.q_norm), (g, a.k_lif, a.k_norm), (g, a.v_lif, a.v_norm)]
             if "attn" in units and a.attn_norm is not None:
-                self.units.append((i, a.attn_lif, a.attn_norm))
+                self.units.append((g, a.attn_lif, a.attn_norm))
                 gated.append(a.attn_norm)
+            if "proj" in units and a.attn_proj:
+                self.units.append((g, a.proj_lif, a.proj_norm))
+            if "mlp" in units:
+                self.units.append((g, blk.mlp.lif1, blk.mlp.norm1))
+                if blk.mlp.layers == 2:
+                    self.units.append((g, blk.mlp.lif2, blk.mlp.norm2))
         self.model = model
         # spike / nonzero-input counters are preallocated and updated in place, so the
         # hooks keep a fixed structure and torch.compile does not recompile them
@@ -336,6 +355,8 @@ class Homeostasis:
                 push = push * (self.in_rate[key] >= self.target).float()
             if self.upper > 0:
                 push = push - self.eta * ((self.rate[key] - self.upper) / (1 - self.upper)).clamp(0, 1)
+            if self.max_shift > 0:  # keep the cumulative shift bounded
+                push = (self.shift[key] + push).clamp(-self.max_shift, self.max_shift) - self.shift[key]
             norm.bias.add_(push)
             self.shift[key] += push
 
@@ -353,19 +374,32 @@ class Homeostasis:
             if ri is not None:
                 self.in_rate[k] = ri.to(norm.bias.device)
             self.shift[k] = sh.to(norm.bias.device)
+        self.enforce_bound()
+
+    @torch.no_grad()
+    def enforce_bound(self):
+        """Pull shifts beyond max_shift (e.g. from a run resumed with a new bound) back to it,
+        removing the excess from the norm bias too."""
+        if self.max_shift <= 0:
+            return
+        for _, _, norm in self.units:
+            k = id(norm)
+            excess = self.shift[k] - self.shift[k].clamp(-self.max_shift, self.max_shift)
+            norm.bias.sub_(excess)
+            self.shift[k] -= excess
 
     def stats(self) -> dict:
         active, high, shift, up, down = {}, {}, {}, {}, {}
         for i, _, norm in self.units:
             key = id(norm)
             if key in self.rate:
-                active.setdefault(f"block {i}", []).append((self.rate[key] < self.target).float().mean().item())
+                active.setdefault(i, []).append((self.rate[key] < self.target).float().mean().item())
                 if self.upper > 0:
-                    high.setdefault(f"block {i}", []).append((self.rate[key] > self.upper).float().mean().item())
+                    high.setdefault(i, []).append((self.rate[key] > self.upper).float().mean().item())
             sh = self.shift[key]
-            shift.setdefault(f"block {i}", []).append(sh.mean().item())
-            up.setdefault(f"block {i}", []).append(sh.clamp(min=0).mean().item())
-            down.setdefault(f"block {i}", []).append(sh.clamp(max=0).mean().item())
+            shift.setdefault(i, []).append(sh.mean().item())
+            up.setdefault(i, []).append(sh.clamp(min=0).mean().item())
+            down.setdefault(i, []).append(sh.clamp(max=0).mean().item())
         out = {"homeo_shift_up": {g: sum(v) / len(v) for g, v in up.items()},
                "homeo_shift_down": {g: sum(v) / len(v) for g, v in down.items()},
                "homeo_active": {g: sum(v) / len(v) for g, v in active.items()},

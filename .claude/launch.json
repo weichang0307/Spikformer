@@ -4,8 +4,52 @@
     {
       "name": "dashboard",
       "runtimeExecutable": "python3",
-      "runtimeArgs": ["-m", "http.server", "8765", "--bind", "127.0.0.1", "--directory", "/home/th12-dv/Spikformer"],
-      "port": 8765
+      "runtimeArgs": [
+        "-m",
+        "http.server",
+        "8768",
+        "--bind",
+        "127.0.0.1",
+        "--directory",
+        "/home/th12-dv/Spikformer"
+      ],
+      "port": 8768
+    },
+    {
+      "name": "dashboard-8767",
+      "runtimeExecutable": "python3",
+      "runtimeArgs": [
+        "-m",
+        "http.server",
+        "8767",
+        "--bind",
+        "127.0.0.1",
+        "--directory",
+        "/home/th12-dv/Spikformer"
+      ],
+      "port": 8767
+    },
+    {
+      "name": "playground",
+      "runtimeExecutable": "python3",
+      "runtimeArgs": [
+        "/home/th12-dv/Spikformer/playground_server.py",
+        "--port",
+        "8770"
+      ],
+      "port": 8770
+    },
+    {
+      "name": "folk-playground",
+      "runtimeExecutable": "python3",
+      "runtimeArgs": [
+        "/home/th12-dv/Spikformer/playground_server.py",
+        "--port",
+        "8771",
+        "--device",
+        "cuda"
+      ],
+      "port": 8771
     }
   ]
 }

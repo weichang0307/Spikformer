@@ -1,0 +1,334 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Model Playground</title>
+<style>
+  :root { --bg: #fafafa; --card: #fff; --text: #1d1d1f; --muted: #6e6e73; --border: #e3e3e6;
+          --accent: 58, 142, 224; --sel: #e0803a; --empty: #d9534f; }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg: #161618; --card: #1f1f22; --text: #f2f2f4; --muted: #9a9aa0; --border: #333338; }
+  }
+  body { margin: 0; padding: 16px; background: var(--bg); color: var(--text);
+         font: 14px/1.4 system-ui, -apple-system, "Segoe UI", "Noto Sans TC", sans-serif; }
+  header { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; margin-bottom: 12px; }
+  h1 { font-size: 18px; margin: 0; }
+  h2 { font-size: 15px; margin: 0 0 8px; }
+  h3 { font-size: 13px; margin: 12px 0 6px; color: var(--muted); font-weight: 600; }
+  a { color: rgb(var(--accent)); }
+  .muted { color: var(--muted); }
+  .card { background: var(--card); border: 1px solid var(--border); border-radius: 10px; padding: 12px;
+          margin-bottom: 12px; min-width: 0; }
+  .row { display: flex; gap: 10px; flex-wrap: wrap; align-items: center; }
+  label { font-size: 12px; color: var(--muted); display: inline-flex; gap: 4px; align-items: center; }
+  input, select, textarea, button { font: inherit; color: var(--text); background: var(--bg);
+                                    border: 1px solid var(--border); border-radius: 6px; padding: 4px 6px; }
+  input[type=number] { width: 64px; }
+  textarea { width: 100%; box-sizing: border-box; min-height: 48px; resize: vertical; }
+  button { cursor: pointer; background: rgb(var(--accent)); color: #fff; border-color: transparent; padding: 5px 12px; }
+  button:disabled { opacity: 0.5; cursor: wait; }
+  .status { font-size: 12px; font-variant-numeric: tabular-nums; }
+  .error { color: var(--empty); }
+  .out { margin-top: 8px; padding: 8px; background: var(--bg); border: 1px solid var(--border); border-radius: 6px;
+         white-space: pre-wrap; word-break: break-all; font-size: 15px; line-height: 1.7; max-height: 320px; overflow: auto; }
+  .out span { cursor: pointer; border-radius: 2px; }
+  .out span:hover { outline: 1px solid var(--sel); }
+  .out .p { color: var(--muted); }
+  .layout { display: grid; gap: 12px; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); }
+  @media (max-width: 900px) { .layout { grid-template-columns: minmax(0, 1fr); } }
+  .overview { display: grid; gap: 3px; align-items: center; justify-content: start; overflow-x: auto; }
+  .overview canvas { width: 56px; height: 56px; image-rendering: pixelated; cursor: pointer;
+                     border: 2px solid transparent; border-radius: 3px; }
+  .overview canvas.on { border-color: var(--sel); }
+  .overview .lab { font-size: 11px; color: var(--muted); text-align: center; }
+  #big { width: 100%; max-width: 520px; aspect-ratio: 1; image-rendering: pixelated; cursor: crosshair;
+         border: 1px solid var(--border); display: block; }
+  .tip { font-size: 12px; min-height: 18px; font-variant-numeric: tabular-nums; }
+  .strips { overflow-x: auto; }
+  .strip { display: flex; align-items: center; gap: 0; margin: 2px 0; }
+  .strip .name { width: 64px; flex: none; font-size: 11px; color: var(--muted); cursor: pointer; }
+  .strip .name.on { color: var(--sel); font-weight: 600; }
+  .strip .c { width: 18px; flex: none; text-align: center; font-size: 13px; line-height: 22px; cursor: pointer;
+              border-radius: 2px; }
+  .strip .c.q { outline: 2px solid var(--sel); }
+  .strip .c.f { opacity: 0.25; }
+  .strip .sum { margin-left: 6px; font-size: 11px; color: var(--muted); white-space: nowrap; }
+  .strip .sum.e { color: var(--empty); }
+  table.top { border-collapse: collapse; font-variant-numeric: tabular-nums; font-size: 13px; }
+  table.top td { padding: 2px 8px 2px 0; }
+  .bar { height: 8px; background: rgb(var(--accent)); border-radius: 2px; }
+  @media (max-width: 420px) { body { padding: 8px; } }
+</style>
+</head>
+<body>
+<header>
+  <h1>Model Playground</h1>
+  <label>run <select id="run"></select></label>
+  <label>checkpoint <select id="ckpt"><option value="last">last.pt</option><option value="best">best.pt</option></select></label>
+  <label>T <input id="T" type="number" min="1" max="64"></label>
+  <span class="status muted" id="status"></span>
+  <a href="dashboard.html" class="status">training monitor</a>
+</header>
+
+<div class="card">
+  <h2>Generate</h2>
+  <textarea id="prompt" placeholder="prompt (empty = a single space)"></textarea>
+  <div class="row" style="margin-top:6px">
+    <label>characters <input id="n" type="number" value="200" min="1" max="2000"></label>
+    <label>temperature <input id="temp" type="number" value="0.8" step="0.1" min="0.05"></label>
+    <label>top-k <input id="topk" type="number" value="0" min="0" title="0 = sample from every character"></label>
+    <button id="gen">Generate</button>
+    <span class="status muted" id="genStatus"></span>
+  </div>
+  <div class="out" id="genOut" hidden></div>
+  <div class="muted status" style="margin-top:4px">Click a character to see the attention when the model predicts the character after it.</div>
+</div>
+
+<div class="card">
+  <h2>Attention</h2>
+  <textarea id="attnText" placeholder="text to analyse; only the last N characters are used"></textarea>
+  <div class="row" style="margin-top:6px">
+    <label>compare with <select id="cmp"><option value="">(none)</option></select></label>
+    <label>checkpoint <select id="cmpCkpt"><option value="last">last.pt</option><option value="best">best.pt</option></select></label>
+    <label>T <input id="cmpT" type="number" min="1" max="64"></label>
+    <label>and <select id="cmp2"><option value="">(none)</option></select></label>
+    <label>checkpoint <select id="cmp2Ckpt"><option value="last">last.pt</option><option value="best">best.pt</option></select></label>
+    <label>T <input id="cmp2T" type="number" min="1" max="64"></label>
+    <label>characters <input id="maxLen" type="number" value="128" min="8" max="1024" title="last N characters of the text (maps are N x N)"></label>
+    <button id="ana">Analyse</button>
+    <label><input type="checkbox" id="norm" checked> rows as distributions (row / row sum)</label>
+    <span class="status muted" id="anaStatus"></span>
+  </div>
+  <div id="attnBody" hidden>
+    <div class="muted status" style="margin:6px 0">Rows = query position, columns = key position. Click a small map to select a block and head
+      (both models follow the selection), click a row in a large map to choose the query.</div>
+    <div class="panes" id="panes"></div>
+  </div>
+</div>
+
+<script>
+const $ = id => document.getElementById(id);
+let runs = [];
+const vis = c => c === " " ? "␣" : c;
+
+function store(k, v) { try { localStorage.setItem("pg_" + k, v); } catch (e) {} }
+function load(k) { try { return localStorage.getItem("pg_" + k); } catch (e) { return null; } }
+
+async function api(path, body) {
+  const r = await fetch(path, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
+  const j = await r.json();
+  if (!r.ok || j.error) throw new Error(j.error || r.statusText);
+  return j;
+}
+const req = extra => ({ run: $("run").value, ckpt: $("ckpt").value, T: +$("T").value || undefined, ...extra });
+const runInfo = () => runs.find(r => r.name === $("run").value);
+
+async function loadRuns() {
+  try {
+    runs = await (await fetch("api/runs", { cache: "no-store" })).json();
+  } catch (e) {
+    $("status").innerHTML = '<span class="error">API not reachable: start <code>python3 playground_server.py</code> and open this page from it</span>';
+    return;
+  }
+  const want = new URLSearchParams(location.search).get("run") || load("run");
+  $("run").innerHTML = runs.map(r => `<option>${r.name}</option>`).join("");
+  if (runs.some(r => r.name === want)) $("run").value = want;
+  const params = new URLSearchParams(location.search);
+  for (const [id, key] of [["cmp", "compare"], ["cmp2", "compare2"]]) {
+    $(id).innerHTML = '<option value="">(none)</option>' + runs.map(r => `<option>${r.name}</option>`).join("");
+    const want = params.get(key) || load(id);
+    if (runs.some(r => r.name === want)) { $(id).value = want; onCompare(id); }
+  }
+  onRun();
+}
+function onRun() {
+  const r = runInfo(); if (!r) return;
+  store("run", r.name);
+  $("T").value = r.T;
+  $("ckpt").querySelectorAll("option").forEach(o => o.disabled = !r.ckpts.includes(o.value));
+  if (!r.ckpts.includes($("ckpt").value)) $("ckpt").value = r.ckpts[0];
+  $("status").textContent = `${r.dim} wide × ${r.depth} blocks × ${r.num_heads} heads, context ${r.block_size}, ` +
+    `vocab ${r.vocab_size.toLocaleString()}, trained at T=${r.T}`;
+}
+$("run").onchange = onRun;
+
+// ---------- generation ----------
+let genChars = [];   // full text (prompt + sample) as characters
+$("gen").onclick = async () => {
+  $("gen").disabled = true; $("genStatus").textContent = "generating…";
+  const t0 = performance.now();
+  try {
+    const j = await api("api/generate", req({ prompt: $("prompt").value, num_chars: +$("n").value,
+                                             temperature: +$("temp").value, top_k: +$("topk").value }));
+    const p = [...j.prompt], g = [...j.text];
+    genChars = p.concat(g);
+    $("genOut").innerHTML = genChars.map((c, i) =>
+      `<span data-i="${i}"${i < p.length ? ' class="p"' : ""}>${esc(c)}</span>`).join("");
+    $("genOut").hidden = false;
+    $("genStatus").textContent = `step ${j.step ?? "?"} · ${g.length} characters in ${((performance.now() - t0) / 1000).toFixed(1)} s`;
+  } catch (e) { $("genStatus").innerHTML = `<span class="error">${esc(e.message)}</span>`; }
+  $("gen").disabled = false;
+};
+$("genOut").onclick = e => {
+  const i = e.target.dataset && e.target.dataset.i; if (i === undefined) return;
+  $("attnText").value = genChars.slice(0, +i + 1).join("");
+  analyse(true);
+};
+function esc(s) { return s.replace(/[&<>"]/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c])); }
+
+// ---------- attention (one pane per model; selection shared) ----------
+let panes = [], sel = { layer: 0, head: 0, q: 0 };   // head = H means "mean of heads"
+$("ana").onclick = () => analyse(true);
+$("norm").onchange = () => panes.length && renderAll();
+function onCompare(id) {   // a compare selector changed: default its T and checkpoint to that run's
+  const r = runs.find(r => r.name === $(id).value);
+  if (r) {
+    $(id + "T").value = r.T;
+    $(id + "Ckpt").querySelectorAll("option").forEach(o => o.disabled = !r.ckpts.includes(o.value));
+    if (!r.ckpts.includes($(id + "Ckpt").value)) $(id + "Ckpt").value = r.ckpts[0];
+  }
+  store(id, $(id).value);
+}
+$("cmp").onchange = () => onCompare("cmp");
+$("cmp2").onchange = () => onCompare("cmp2");
+
+function decode(name, d) {   // compact payload -> per-row distributions (uint8) and row sums
+  const bin = atob(d.attn_q), q = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) q[i] = bin.charCodeAt(i);
+  const [nL, H, L] = d.shape;
+  return { name, ...d, q, nL, H, L, cache: {} };
+}
+function mapOf(p, l, h) {    // Float32Array(L * L) of raw values: spike counts or softmax weights
+  const key = l * 1000 + h; if (p.cache[key]) return p.cache[key];
+  const { L, H, q, row_sums } = p, m = new Float32Array(L * L);
+  if (h < H) {
+    const base = (l * H + h) * L * L;
+    for (let i = 0; i < L; i++) { const s = row_sums[l][h][i] / 255; for (let j = 0; j < L; j++) m[i * L + j] = q[base + i * L + j] * s; }
+  } else for (let hh = 0; hh < H; hh++) { const mh = mapOf(p, l, hh); for (let k = 0; k < L * L; k++) m[k] += mh[k] / H; }
+  return (p.cache[key] = m);
+}
+const rowSum = (m, L, i) => { let s = 0; for (let j = 0; j < L; j++) s += m[i * L + j]; return s; };
+const unit = p => p.kind === "softmax" ? "weight" : "overlap";
+
+async function analyse(queryLast) {
+  $("ana").disabled = true; $("anaStatus").textContent = "running…";
+  const text = $("attnText").value, max_len = +$("maxLen").value || 128;
+  const jobs = [[$("run").value, req({ text, max_len })]];
+  for (const id of ["cmp", "cmp2"])
+    if ($(id).value) jobs.push([$(id).value, { run: $(id).value, ckpt: $(id + "Ckpt").value, T: +$(id + "T").value || undefined, text, max_len }]);
+  try {
+    const t0 = performance.now();
+    const res = await Promise.all(jobs.map(([, body]) => api("api/attention", body)));
+    panes = res.map((d, i) => decode(jobs[i][0], d));
+    const L = Math.min(...panes.map(p => p.L));
+    sel.layer = Math.min(sel.layer, Math.min(...panes.map(p => p.nL)) - 1);
+    if (queryLast || sel.q >= L) sel.q = L - 1;
+    $("anaStatus").textContent = `${L} characters · ${((performance.now() - t0) / 1000).toFixed(1)} s`;
+    $("attnBody").hidden = false;
+    renderAll();
+  } catch (e) { $("anaStatus").innerHTML = `<span class="error">${esc(e.message)}</span>`; }
+  $("ana").disabled = false;
+}
+
+function paint(canvas, m, L, markQ) {
+  canvas.width = L; canvas.height = L;
+  const ctx = canvas.getContext("2d"), img = ctx.createImageData(L, L);
+  const dark = matchMedia("(prefers-color-scheme: dark)").matches;
+  const bg = dark ? [31, 31, 34] : [255, 255, 255], fg = [58, 142, 224];
+  const norm = $("norm").checked; let mx = 1e-9;
+  if (!norm) for (let k = 0; k < L * L; k++) mx = Math.max(mx, m[k]);
+  for (let i = 0; i < L; i++) {
+    const s = rowSum(m, L, i);
+    for (let j = 0; j < L; j++) {
+      let c;
+      if (j > i) c = dark ? [22, 22, 24] : [238, 238, 240];               // future (masked)
+      else if (s === 0) c = dark ? [70, 30, 30] : [250, 225, 225];        // empty row
+      else { const a = Math.sqrt(norm ? m[i * L + j] / s : m[i * L + j] / mx); c = bg.map((b, t) => b + (fg[t] - b) * a); }
+      img.data.set([...c, 255], 4 * (i * L + j));
+    }
+  }
+  ctx.putImageData(img, 0, 0);
+  if (markQ !== undefined) { ctx.fillStyle = "rgba(224,128,58,0.9)"; ctx.fillRect(0, markQ, 1, 1); ctx.fillRect(markQ, markQ, 1, 1); }
+}
+const el = (tag, cls, text) => Object.assign(document.createElement(tag), cls ? { className: cls } : {}, text !== undefined ? { textContent: text } : {});
+
+function renderAll() {
+  const box = $("panes"); box.innerHTML = "";
+  box.style.display = "grid"; box.style.gap = "16px";
+  box.style.gridTemplateColumns = `repeat(${panes.length}, minmax(240px, 1fr))`;
+  box.style.overflowX = "auto";   // three panes on a narrow window scroll inside the card, not the page
+  panes.forEach(p => box.append(renderPane(p)));
+}
+function renderPane(p) {
+  const { nL, H, L, tokens: toks } = p, root = el("div");
+  const layer = Math.min(sel.layer, nL - 1), head = Math.min(sel.head, H), q = Math.min(sel.q, L - 1);
+  const h2 = el("h3"); h2.innerHTML = `<b>${esc(p.name)}</b> <span class="muted" style="font-weight:400">· step ${p.step ?? "?"} · ${p.kind}</span>`;
+  root.append(h2);
+  const ov = el("div", "overview"); ov.style.gridTemplateColumns = `auto repeat(${H + 1}, auto)`;
+  ov.append(el("div", "lab"));
+  for (let h = 0; h <= H; h++) ov.append(el("div", "lab", h === H ? "mean" : `h${h}`));
+  for (let l = 0; l < nL; l++) {
+    ov.append(el("div", "lab", `b${l}`));
+    for (let h = 0; h <= H; h++) {
+      const c = el("canvas"); c.style.width = c.style.height = ["56px", "40px", "28px"][Math.min(panes.length, 3) - 1];
+      paint(c, mapOf(p, l, h), L);
+      c.title = `block ${l}, ${h === H ? "mean of heads" : "head " + h}`;
+      if (l === layer && h === head) c.classList.add("on");
+      c.onclick = () => { sel.layer = l; sel.head = h; renderAll(); };
+      ov.append(c);
+    }
+  }
+  root.append(ov);
+  const m = mapOf(p, layer, head);
+  root.append(el("h3", "", `block ${layer}, ${head === H ? "mean of heads" : "head " + head}`));
+  const big = el("canvas"); big.id = ""; big.style.cssText = "width:100%;max-width:520px;aspect-ratio:1;image-rendering:pixelated;cursor:crosshair;border:1px solid var(--border);display:block";
+  paint(big, m, L, q);
+  const tip = el("div", "tip");
+  big.onmousemove = e => {
+    const r = big.getBoundingClientRect(), j = Math.floor((e.clientX - r.left) / r.width * L), i = Math.floor((e.clientY - r.top) / r.height * L);
+    if (i < 0 || j < 0 || i >= L || j >= L) return;
+    const s = rowSum(m, L, i), v = m[i * L + j];
+    tip.textContent = j > i ? `query ${i} "${vis(toks[i])}" → key ${j}: future (masked)`
+      : `query ${i} "${vis(toks[i])}" → key ${j} "${vis(toks[j])}": ${v.toFixed(3)} ${unit(p)}` + (s > 0 ? `, ${(100 * v / s).toFixed(1)}% of the row` : ", empty row");
+  };
+  big.onclick = e => { const r = big.getBoundingClientRect(); sel.q = Math.min(L - 1, Math.max(0, Math.floor((e.clientY - r.top) / r.height * L))); renderAll(); };
+  root.append(big, tip);
+
+  const st = el("h3"); st.innerHTML = `block ${layer}: where query <b>${esc(vis(toks[q]))}</b> (position ${q}) looks, per head`;
+  const strips = el("div", "strips");
+  for (let h = 0; h <= H; h++) {
+    const mh = mapOf(p, layer, h), s = rowSum(mh, L, q); let mx = 1e-9, peak = -1, pv = 0;
+    for (let j = 0; j <= q; j++) { const v = mh[q * L + j]; mx = Math.max(mx, v); if (v > pv) { pv = v; peak = j; } }
+    const div = el("div", "strip");
+    const name = el("span", "name" + (h === head ? " on" : ""), h === H ? "mean" : `head ${h}`);
+    name.onclick = () => { sel.head = h; renderAll(); };
+    div.append(name);
+    toks.forEach((c, j) => {
+      const sp = el("span", "c" + (j === q ? " q" : "") + (j > q ? " f" : ""), vis(c));
+      const v = mh[q * L + j], a = j <= q && s > 0 ? ($("norm").checked ? v / s : v / mx) : 0;
+      sp.style.background = `rgba(var(--accent), ${Math.min(1, Math.sqrt(a)).toFixed(3)})`;
+      sp.title = `key ${j} "${vis(c)}": ${v.toFixed(3)} ${unit(p)}` + (s > 0 ? `, ${(100 * v / s).toFixed(1)}% of the row` : "");
+      sp.onclick = () => { sel.q = j; renderAll(); };
+      div.append(sp);
+    });
+    div.append(el("span", "sum" + (s === 0 ? " e" : ""), s === 0 ? "empty (no overlap)"
+      : `peak ${vis(toks[peak])}@${peak} ${(100 * pv / s).toFixed(0)}%`));
+    strips.append(div);
+  }
+  root.append(st, strips);
+  requestAnimationFrame(() => { strips.scrollLeft = Math.max(0, 64 + 18 * (q + 1) - strips.clientWidth + 120); });
+
+  const nxt = q + 1 < L ? toks[q + 1] : null, pn = p.p_next[q];
+  const tt = el("h3"); tt.innerHTML = `prediction after <b>${esc(vis(toks[q]))}</b>` +
+    (nxt !== null ? ` (actual next: <b>${esc(vis(nxt))}</b>, p = ${(100 * pn).toFixed(1)}%)` : " (end of text)");
+  const tbl = el("table", "top");
+  tbl.innerHTML = p.top[q].map(([c, pr]) => `<tr><td><b>${esc(vis(c))}</b></td><td>${(100 * pr).toFixed(1)}%</td>` +
+    `<td style="width:140px"><div class="bar" style="width:${(100 * pr).toFixed(1)}%"></div></td></tr>`).join("");
+  root.append(tt, tbl);
+  return root;
+}
+loadRuns();
+</script>
+</body>
+</html>

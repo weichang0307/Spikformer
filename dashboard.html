@@ -31,20 +31,93 @@
   pre.sample { margin: 8px 0 0; padding: 8px; max-height: 220px; overflow: auto; white-space: pre-wrap;
                background: var(--bg); border: 1px solid var(--border); border-radius: 6px; font-size: 12px; }
   @media (max-width: 420px) { body { padding: 8px; } .grid, .charts { grid-template-columns: 1fr; } }
+  #picker { position: relative; }
+  #picker > summary { cursor: pointer; user-select: none; padding: 3px 10px; border: 1px solid var(--border);
+                      border-radius: 6px; background: var(--card); list-style: none; }
+  #picker .pick { position: absolute; z-index: 10; top: 30px; left: 0; width: min(520px, calc(100vw - 32px));
+                  max-height: 60vh; overflow: auto; background: var(--card); border: 1px solid var(--border);
+                  border-radius: 8px; padding: 8px; box-shadow: 0 4px 16px rgba(0,0,0,.15); }
+  #picker input[type=text] { width: 100%; box-sizing: border-box; margin-bottom: 6px; padding: 4px 6px; font: inherit;
+                             color: var(--text); background: var(--bg); border: 1px solid var(--border); border-radius: 6px; }
+  #picker label { display: flex; gap: 6px; align-items: baseline; padding: 2px 0; font-size: 13px; cursor: pointer; }
+  #picker .when { margin-left: auto; color: var(--muted); font-size: 11px; white-space: nowrap; }
+  #picker .live { color: #2fa86b; }
+  #picker button { font: inherit; padding: 3px 10px; border-radius: 6px; border: 1px solid var(--border);
+                   background: var(--bg); color: var(--text); cursor: pointer; }
 </style>
 </head>
 <body>
 <header>
   <h1>Training Monitor</h1>
-  <span class="muted">Refreshes every 5 s. <code>?runs=a,b</code> picks runs. Stop a run: <code>touch runs/&lt;run&gt;/STOP</code></span>
+  <details id="picker"><summary>runs ▾</summary>
+    <div class="pick">
+      <input type="text" id="pickFilter" placeholder="filter runs…">
+      <div id="pickList" class="muted">loading runs…</div>
+      <div style="display:flex; gap:8px; margin-top:8px">
+        <button id="pickApply">show selected</button><button id="pickClear">clear</button>
+      </div>
+    </div>
+  </details>
+  <span class="muted">Refreshes every 5 s. Stop a run: <code>touch runs/&lt;run&gt;/STOP</code></span>
+  <a id="pg" href="playground.html">model playground</a>
 </header>
 <div class="grid" id="grid"></div>
 <script>
 const params = new URLSearchParams(location.search);
-const RUNS = (params.get("runs") || "char_512d4L_T16_proj_nwd").split(",");
-const COLORS = { train: "#9a9aa0", 4: "#e0803a", 8: "#3a8ee0", 16: "#2fa86b", 32: "#a35cd6" };
-const GROUP_COLORS = { input: "#9a9aa0", head: "#8a6d3b", "block 0": "#e0803a", "block 1": "#3a8ee0",
-                       "block 2": "#2fa86b", "block 3": "#a35cd6", "block 4": "#d64f7a", "block 5": "#3ab0b0" };
+// the playground needs playground_server.py (port 8770); link there unless this page is already served by it
+if (location.port !== "8770") document.getElementById("pg").href = `http://${location.hostname}:8770/playground.html`;
+// runs to show: ?runs=a,b, else the last selection on this browser, else the most recently updated run
+const storedRuns = (() => { try { return localStorage.getItem("dash_runs"); } catch (e) { return null; } })();
+const RUNS = (params.get("runs") || storedRuns || "").split(",").filter(Boolean);
+try { if (RUNS.length) localStorage.setItem("dash_runs", RUNS.join(",")); } catch (e) {}
+
+// run picker: every run folder with a live.json, newest first (from the server's directory listing)
+async function listRuns() {
+  const html = await (await fetch("runs/", { cache: "no-store" })).text();
+  const names = [...html.matchAll(/href="([^"\/?]+)\/"/g)].map(m => decodeURIComponent(m[1]));
+  const found = await Promise.all(names.map(async name => {
+    try {
+      const r = await fetch(`runs/${encodeURIComponent(name)}/live.json`, { method: "HEAD", cache: "no-store" });
+      return r.ok ? { name, t: Date.parse(r.headers.get("Last-Modified")) || 0 } : null;
+    } catch (e) { return null; }
+  }));
+  return found.filter(Boolean).sort((a, b) => b.t - a.t);
+}
+function ago(t) {
+  const m = (Date.now() - t) / 60000;
+  return m < 60 ? `${Math.round(m)} min ago` : m < 2880 ? `${Math.round(m / 60)} h ago` : `${Math.round(m / 1440)} d ago`;
+}
+function showRuns(list) {
+  if (!list.length) return;
+  const url = new URL(location.href); url.searchParams.set("runs", list.join(","));
+  location.href = url.toString();
+}
+listRuns().then(runs => {
+  if (!RUNS.length && runs.length) return showRuns([runs[0].name]);   // nothing chosen yet: newest run
+  const box = document.getElementById("pickList"), filter = document.getElementById("pickFilter");
+  const render = () => {
+    const q = filter.value.toLowerCase();
+    box.classList.remove("muted");
+    box.innerHTML = runs.filter(r => r.name.toLowerCase().includes(q)).map(r =>
+      `<label><input type="checkbox" value="${r.name}"${RUNS.includes(r.name) ? " checked" : ""}> ${r.name}` +
+      `<span class="when${Date.now() - r.t < 15 * 60000 ? " live" : ""}">${Date.now() - r.t < 15 * 60000 ? "● " : ""}${ago(r.t)}</span></label>`).join("")
+      || '<span class="muted">no matching runs</span>';
+  };
+  filter.oninput = render;
+  render();
+  document.getElementById("pickApply").onclick = () =>
+    showRuns([...box.querySelectorAll("input:checked")].map(i => i.value));
+  document.getElementById("pickClear").onclick = () => box.querySelectorAll("input").forEach(i => i.checked = false);
+}).catch(() => { document.getElementById("pickList").textContent = "could not list runs/"; });
+const COLORS = { train: "#9a9aa0", 2: "#c9a227", 4: "#e0803a", 6: "#d6455d", 8: "#3a8ee0", 12: "#17a2b8",
+                 16: "#2fa86b", 24: "#8a6d3b", 32: "#a35cd6", 64: "#555555" };
+const T_FALLBACK = ["#e377c2", "#7f7f7f", "#bcbd22", "#1f77b4"];
+const colorT = T => COLORS[T] || T_FALLBACK[T % T_FALLBACK.length];   // one fixed colour per T, across runs
+const GROUP_COLORS = { input: "#9a9aa0", head: "#8a6d3b" };
+// one colour per block, for models up to 16 blocks deep (blocks 0-5 keep their earlier colours)
+const BLOCK_COLORS = ["#e0803a", "#3a8ee0", "#2fa86b", "#a35cd6", "#d64f7a", "#3ab0b0", "#c9a227", "#1f4e9c",
+                      "#7a9c1f", "#e04a3a", "#6b4fd6", "#1f9c6e", "#b05a9c", "#5a6b7a", "#e0b03a", "#3a5ae0"];
+const groupColor = g => GROUP_COLORS[g] || (g.startsWith("block ") ? BLOCK_COLORS[+g.slice(6) % BLOCK_COLORS.length] : "#888");
 
 // Training-health panels (fields written by health.py via train_char.py).
 // perLIF: values keyed by LIF name, averaged per block; pct: plot as %; log: log y axis.
@@ -53,9 +126,15 @@ const HEALTH = [
   { field: "fire_rate", title: "LIF firing rate (%)", perLIF: true, pct: true, fixed: [0, 100] },
   { field: "fire_dead", title: "never-fired features (%)", perLIF: true, pct: true, floor10: true },
   { field: "fire_sat", title: "saturated features, rate ≥ 90% (%)", perLIF: true, pct: true, floor10: true },
-  { field: "surrogate", title: "mean surrogate gradient (peak 0.5)", perLIF: true, min: 0 },
+  { field: "surrogate", title: "mean surrogate gradient (peak α/4; 0.5 at α = 2)", perLIF: true, min: 0 },
   { section: "Optimisation" },
   { field: "lr", title: "learning rate (log)", scalar: true, log: true },
+  { field: "surrogate_alpha", title: "surrogate gradient α (steepness; peak α/4)", scalar: true },
+  { section: "Distillation from the ANN teacher" },
+  { field: "train_kl", title: "output KL to the teacher (nats, train)", scalar: true },
+  { field: "ce_weight", title: "CE weight of the output loss (1 − weight on output KL)", scalar: true },
+  { field: "attn_weight", title: "attention-distillation weight λ", scalar: true },
+  { field: "train_attn_kl", title: "attention KL, student vs teacher heads (nats, train)", scalar: true },
   { field: "grad_norm", title: "gradient norm (log)", log: true },
   { field: "update_ratio", title: "update / weight norm per step (log)", log: true },
   { field: "norm_gain", title: "mean |L1 norm gain|", min: 0 },
@@ -68,15 +147,16 @@ const HEALTH = [
   { section: "Attention and context use" },
   { field: "attn_dead_heads", title: "dead heads, attention LIF < 0.5% (%)", pct: true, min: 0, max: 100 },
   { field: "attn_empty", title: "query rows with no Q·K overlap (%)", pct: true, min: 0, max: 100 },
+  { field: "attn_threshold", title: "learned Q·K count threshold (mean of thresholded heads)" },
   { field: "attn_entropy", title: "attention spread (1 = uniform over context)", min: 0, max: 1 },
   { field: "attn_local", title: "attention on last 8 positions (%)", pct: true, min: 0 },
   { field: "context_gain", title: "context gain: loss(self only) − loss (nats)", scalar: true },
-  { section: "Homeostatic bias (Q/K/V)" },
-  { field: "homeo_active", title: "Q/K/V features below target rate (%)", pct: true, min: 0, max: 100 },
-  { field: "homeo_high", title: "Q/K/V features above upper target (%)", pct: true, min: 0, max: 100 },
-  { field: "homeo_shift", title: "mean Q/K/V norm bias shift" },
-  { field: "homeo_shift_up", title: "Q/K/V bias raised (mean over features)" },
-  { field: "homeo_shift_down", title: "Q/K/V bias lowered (mean over features)" },
+  { section: "Homeostatic bias (regulated NL units)" },
+  { field: "homeo_active", title: "regulated features below target rate (%)", pct: true, min: 0, max: 100 },
+  { field: "homeo_high", title: "regulated features above upper target (%)", pct: true, min: 0, max: 100 },
+  { field: "homeo_shift", title: "mean regulated norm bias shift" },
+  { field: "homeo_shift_up", title: "bias raised (mean over regulated features)" },
+  { field: "homeo_shift_down", title: "bias lowered (mean over regulated features)" },
   { section: "Adaptive gradient clipping" },
   { field: "clip_frac", title: "steps clipped since last eval (%)", pct: true, min: 0 },
   { field: "grad_spike", title: "largest gradient / running average (log)", log: true },
@@ -125,7 +205,7 @@ function healthSeries(h, panel) {
     const lists = groups[g], n = Math.min(...lists.map(v => v.length));
     const offset = h.step.length - n;
     return {
-      label: g, borderColor: GROUP_COLORS[g] || "#888",
+      label: g, borderColor: groupColor(g),
       data: Array.from({ length: n }, (_, j) => ({
         x: h.step[j + offset],
         y: k * lists.reduce((sum, v) => sum + v[v.length - n + j], 0) / lists.length,
@@ -240,7 +320,7 @@ async function refresh() {
     for (const [metric, chart] of [["acc", charts[run].acc], ["loss", charts[run].loss]]) {
       chart.data.datasets = [
         { label: "train", data: series(h, `train_${metric}`), borderColor: COLORS.train, borderDash: [4, 3] },
-        ...Ts.map(T => ({ label: `eval T=${T}`, data: series(h, `${metric}_T${T}`), borderColor: COLORS[T] || "#888" })),
+        ...Ts.map(T => ({ label: `eval T=${T}`, data: series(h, `${metric}_T${T}`), borderColor: colorT(T) })),
       ];
       chart.update();
     }
@@ -251,7 +331,7 @@ async function refresh() {
       charts[run].bpc.data.datasets = [
         { label: "train", data: h.step.map((s, i) => ({ x: s, y: h.train_loss[i] / Math.LN2 })),
           borderColor: COLORS.train, borderDash: [4, 3] },
-        ...Ts.map(T => ({ label: `eval T=${T}`, data: series(h, `bpc_T${T}`), borderColor: COLORS[T] || "#888" })),
+        ...Ts.map(T => ({ label: `eval T=${T}`, data: series(h, `bpc_T${T}`), borderColor: colorT(T) })),
       ];
       charts[run].bpc.update();
     }

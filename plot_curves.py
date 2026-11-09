@@ -1,8 +1,9 @@
 """Plot training curves from runs' live.json files into one figure.
 
-First two panels: eval accuracy (recall or next char) at the largest evaluated
-T (solid) and at T=4 (dotted); eval loss at the largest T (solid) and training
-loss (faint), log scale.
+First two panels: eval accuracy (recall or next char) at every evaluated T;
+eval loss at every T and training loss (faint grey), log scale; for character
+LMs a bits-per-character panel follows. Colour = T (fixed per T across runs),
+line style = run.
 
 For runs that log training-health metrics (train_char.py, see health.py), one
 panel per metric follows, in a two-column grid: firing rate, never-fired and
@@ -37,8 +38,14 @@ HEALTH = [
     ("fire_rate", "LIF firing rate (%)", True, True, False, (0, None)),
     ("fire_dead", "never-fired features (%)", True, True, False, (0, 100)),
     ("fire_sat", "saturated features, rate >= 90% (%)", True, True, False, (0, None)),
-    ("surrogate", "mean surrogate gradient (peak 0.5)", True, False, False, (0, None)),
+    ("surrogate", "mean surrogate gradient (peak alpha / 4)", True, False, False, (0, None)),
     ("lr", "learning rate", False, False, True, None),
+    ("surrogate_alpha", "surrogate gradient alpha (steepness)", False, False, False, None),
+    ("train_kl", "output KL to the teacher (nats, train)", False, False, False, None),
+    ("ce_weight", "CE weight of the output loss", False, False, False, None),
+    ("attn_weight", "attention-distillation weight lambda", False, False, False, None),
+    ("train_attn_kl", "attention KL to the teacher heads (nats, train)", False, False, False, None),
+    ("train_spread", "attention spread of the penalised heads (train, 1 = uniform)", False, False, False, None),
     ("grad_norm", "gradient norm", False, False, True, None),
     ("update_ratio", "update / weight norm per step", False, False, True, None),
     ("norm_gain", "mean |L1 norm gain|", False, False, False, None),
@@ -50,19 +57,33 @@ HEALTH = [
     ("head_scale_spread", "largest / smallest head scale", False, False, True, None),
     ("attn_dead_heads", "dead heads, attention LIF < 0.5% (%)", False, True, False, (0, 100)),
     ("attn_empty", "query rows with no Q.K overlap (%)", False, True, False, (0, 100)),
+    ("attn_threshold", "learned Q.K count threshold (mean of thresholded heads)", False, False, False, None),
     ("attn_entropy", "attention spread (1 = uniform)", False, False, False, (0, 1)),
     ("attn_local", "attention on last 8 positions (%)", False, True, False, (0, None)),
     ("context_gain", "context gain: loss(self only) - loss (nats)", False, False, False, None),
-    ("homeo_active", "Q/K/V features below target rate (%)", False, True, False, (0, 100)),
-    ("homeo_high", "Q/K/V features above upper target (%)", False, True, False, (0, 100)),
-    ("homeo_shift", "mean Q/K/V norm bias shift", False, False, False, None),
-    ("homeo_shift_up", "Q/K/V bias raised (mean over features)", False, False, False, None),
-    ("homeo_shift_down", "Q/K/V bias lowered (mean over features)", False, False, False, None),
+    ("homeo_active", "regulated features below target rate (%)", False, True, False, (0, 100)),
+    ("homeo_high", "regulated features above upper target (%)", False, True, False, (0, 100)),
+    ("homeo_shift", "mean regulated norm bias shift", False, False, False, None),
+    ("homeo_shift_up", "bias raised (mean over regulated features)", False, False, False, None),
+    ("homeo_shift_down", "bias lowered (mean over regulated features)", False, False, False, None),
     ("clip_frac", "steps clipped since last eval (%)", False, True, False, (0, None)),
     ("grad_spike", "largest gradient / running average", False, False, True, None),
 ]
-GROUP_COLORS = {"input": "0.55", "head": "#8a6d3b", "block 0": "C1", "block 1": "C0", "block 2": "C2",
-                "block 3": "C4", "block 4": "C6", "block 5": "C9"}
+T_COLORS = {2: "#c9a227", 4: "#e0803a", 6: "#d6455d", 8: "#3a8ee0", 12: "#17a2b8", 16: "#2fa86b",
+            24: "#8a6d3b", 32: "#a35cd6", 64: "#555555"}
+RUN_STYLES = ("-", "--", ":", "-.")
+# panels kept by --brief
+BRIEF = ("fire_dead", "lr", "grad_spike", "attn_entropy", "context_gain", "train_kl", "train_attn_kl", "attn_threshold", "train_spread")
+GROUP_COLORS = {"input": "0.55", "head": "#8a6d3b"}
+# one colour per block, for models up to 16 blocks deep (blocks 0-5 keep their earlier colours)
+BLOCK_COLORS = ["C1", "C0", "C2", "C4", "C6", "C9", "#c9a227", "#1f4e9c", "#7a9c1f", "#e04a3a", "#6b4fd6", "#1f9c6e",
+                "#b05a9c", "#5a6b7a", "#e0b03a", "#3a5ae0"]
+
+
+def group_color(g: str) -> str:
+    if g in GROUP_COLORS:
+        return GROUP_COLORS[g]
+    return BLOCK_COLORS[int(g.split()[-1]) % len(BLOCK_COLORS)] if g.startswith("block ") else "C0"
 
 
 def recent_runs(runs_dir: str, minutes: float) -> list[str]:
@@ -104,6 +125,9 @@ def main() -> None:
     parser.add_argument("--runs_dir", default="runs")
     parser.add_argument("--minutes", type=float, default=10, help="'recent' window when no runs are given")
     parser.add_argument("--out", default="runs/analysis/curves.png")
+    parser.add_argument("--brief", action="store_true",
+                        help="only the key panels (accuracy, loss, bpc, lr, never-fired features, gradient spikes, "
+                             "attention spread, context gain, distillation KLs), larger and at higher resolution")
     args = parser.parse_args()
 
     runs = args.runs or recent_runs(args.runs_dir, args.minutes)
@@ -123,21 +147,24 @@ def main() -> None:
         return len(set(values)) <= 1
 
     panels = [p for p in HEALTH if any(h.get(p[0]) for h in histories.values()) and not scale_fixed(p[0])]
+    if args.brief:
+        panels = [p for p in panels if p[0] in BRIEF]
     has_bpc = any(any(k.startswith("bpc_T") for k in h) for h in histories.values())
     rows = 1 + math.ceil((len(panels) + has_bpc) / 2)
-    fig, axes = plt.subplots(rows, 2, figsize=(14, 3.2 * rows), squeeze=False)
+    fig, axes = plt.subplots(rows, 2, figsize=(16, 4.2 * rows) if args.brief else (14, 3.2 * rows), squeeze=False)
     colors = plt.rcParams["axes.prop_cycle"].by_key()["color"]
 
     acc_ax, loss_ax = axes[0]
-    for color, run in zip(colors, runs):
+    t_color = lambda T: T_COLORS.get(T, colors[T % len(colors)])
+    for ls, run in zip(RUN_STYLES * 4, runs):
         h = histories[run]
         Ts = sorted(int(k[5:]) for k in h if k.startswith("acc_T"))
         Tm = Ts[-1]
-        acc_ax.plot(h["step"], [a * 100 for a in h[f"acc_T{Tm}"]], color=color, lw=1.3, label=f"{run}, T={Tm}")
-        if 4 in Ts and Tm != 4:
-            acc_ax.plot(h["step"], [a * 100 for a in h["acc_T4"]], color=color, lw=0.8, ls=":", label=f"{run}, T=4")
-        loss_ax.plot(h["step"], h[f"loss_T{Tm}"], color=color, lw=1.3, label=f"{run}, eval")
-        loss_ax.plot(h["step"], h["train_loss"], color=color, lw=0.8, alpha=0.4, label=f"{run}, train")
+        tag = f"{run}, " if len(runs) > 1 else ""
+        for T in Ts:
+            acc_ax.plot(h["step"], [a * 100 for a in h[f"acc_T{T}"]], color=t_color(T), ls=ls, lw=1.3, label=f"{tag}T={T}")
+            loss_ax.plot(h["step"], h[f"loss_T{T}"], color=t_color(T), ls=ls, lw=1.3, label=f"{tag}eval T={T}")
+        loss_ax.plot(h["step"], h["train_loss"], color="0.6", ls=ls, lw=0.8, alpha=0.6, label=f"{tag}train")
 
         i = -1
         latest = ", ".join(f"T={T} {h[f'acc_T{T}'][i] * 100:.1f}%" for T in Ts)
@@ -156,13 +183,13 @@ def main() -> None:
     flat = [ax for row in axes[1:] for ax in row]
     if has_bpc:  # bits per character: val at each eval T (solid / dashed), train loss / ln 2 (faint)
         bpc_ax, flat = flat[0], flat[1:]
-        for color, run in zip(colors, runs):
+        for ls, run in zip(RUN_STYLES * 4, runs):
             h = histories[run]
-            for T, ls in zip(sorted(int(k[5:]) for k in h if k.startswith("bpc_T")), ("-", "--", ":", "-.")):
-                bpc_ax.plot(h["step"], h[f"bpc_T{T}"], color=color, lw=1.3, ls=ls, label=f"{run}, T={T}")
-            if "bpc" in h:
-                bpc_ax.plot(h["step"], [l / math.log(2) for l in h["train_loss"]], color=color, lw=0.8, alpha=0.4,
-                            label=f"{run}, train")
+            tag = f"{run}, " if len(runs) > 1 else ""
+            for T in sorted(int(k[5:]) for k in h if k.startswith("bpc_T")):
+                bpc_ax.plot(h["step"], h[f"bpc_T{T}"], color=t_color(T), lw=1.3, ls=ls, label=f"{tag}T={T}")
+            bpc_ax.plot(h["step"], [l / math.log(2) for l in h["train_loss"]], color="0.6", lw=0.8, alpha=0.6, ls=ls,
+                        label=f"{tag}train")
         bpc_ax.set_title("bits per character (val; train faint)", fontsize=9)
         bpc_ax.legend(fontsize=6, ncol=2)
     for ax, (field, title, _, pct, log, _ylim) in zip(flat, panels):  # y range follows the data
@@ -174,7 +201,7 @@ def main() -> None:
             for g, values in per_block(h[field]).items():
                 steps = h["step"][len(h["step"]) - len(values):]
                 label = g if len(health_runs) == 1 else f"{run}, {g}"
-                ax.plot(steps, [k * v for v in values], color=GROUP_COLORS.get(g, "C0"), ls=styles[run],
+                ax.plot(steps, [k * v for v in values], color=group_color(g), ls=styles[run],
                         lw=1.2, label=label)
         ax.set_title(title, fontsize=9)
         if field == "fire_rate":
@@ -203,7 +230,7 @@ def main() -> None:
             ax.set_xlabel("training step", fontsize=8)
     fig.tight_layout()
     os.makedirs(os.path.dirname(args.out), exist_ok=True)
-    fig.savefig(args.out, dpi=110)
+    fig.savefig(args.out, dpi=150 if args.brief else 110)
     print(f"saved {args.out}")
 
 
