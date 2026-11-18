@@ -1,0 +1,35 @@
+\chapter{Related work}
+\label{ch:related}
+
+\paragraph{Spiking transformers.} Spikformer \citep{zhou2023spikformer} introduced spiking self-attention with
+binary queries, keys and values and no softmax. Its residual connections add spike tensors, so the residual stream
+holds multi-bit values, as in SEW ResNet \citep{fang2021sew}. Spikingformer \citep{zhou2023spikingformer} and the
+Spike-driven Transformer \citep{yao2023spikedriven} move the residual connection onto membrane potentials so that
+every layer receives pure spikes; the Spike-driven Transformer also replaces the score matrix with mask and add
+operations. Other work changes the attention rule: bipolar spikes with a softmax replacement called Shiftmax
+\citep{bipolar2025}, Laplacian kernels over first-spike times \citep{lapis2026}, and addition-only attention with
+full-precision keys \citep{a2os2a2025}. A winner-take-all spiking transformer for language modelling
+\citep{wta2026} is closest to the count thresholds explored in this thesis. A short literature search found no work
+that weights spiking attention by squared overlap counts.
+
+\paragraph{Spiking language models.} SpikeGPT \citep{zhu2023spikegpt} trains a spiking model with an RWKV-style
+recurrent attention for text generation and reports about 1.26--1.28 bits per character on the enwik8 benchmark.
+This thesis started on the same benchmark (Section~\ref{sec:enwik8}).
+
+\paragraph{Symbolic music generation.} folk-rnn \citep{sturm2016folkrnn} trained LSTMs on ABC transcriptions of
+Irish folk music and is the origin of the corpus used here. Transformers now dominate ABC modelling, from large
+pre-trained models such as MuPT \citep{qu2024mupt} to NotaGen \citep{wang2025notagen}. Spiking models of music
+exist but, as far as the search found, operate on pitch sequences rather than ABC text; no spiking transformer for
+ABC was found.
+
+\paragraph{Fair efficiency evaluation.} \citet{yan2024reconsidering} model the energy of spiking networks on
+neuromorphic hardware including memory access and compare them with quantized ANNs of the same structure; they find
+that spiking networks with 5--10 time steps need very sparse activity to win. \citet{shen2024efficient} argue that
+time steps in SNNs play the same role as bit width in quantized ANNs and propose comparing them on a bit budget.
+Chapter~\ref{ch:results} follows this advice and reaches a consistent conclusion.
+
+\paragraph{Quantization techniques.} The integer datapath in this thesis uses ideas from integer-only inference
+\citep{jacob2018quantization}, shift-based multiplication \citep{elhoushi2021deepshift} and straight-through
+gradients \citep{bengio2013estimating}. Folding normalisation parameters into neuron thresholds is known for batch
+normalisation in spiking networks; here the normalisation is per vector and cannot be folded completely, which
+leads to the reciprocal table of Section~\ref{sec:intnorm}.

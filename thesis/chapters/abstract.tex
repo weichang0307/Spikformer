@@ -1,0 +1,27 @@
+\chapter*{Abstract}
+\addcontentsline{toc}{chapter}{Abstract}
+
+Spiking neural networks process information with binary events, which promises cheap hardware: a synapse that
+receives a spike only has to add its weight. This thesis builds a spiking transformer language model for
+symbolic music, takes it all the way to a hardware-ready integer datapath, and measures what that actually saves.
+
+The model learns to write Irish folk tunes in ABC notation from the folk-rnn corpus of about 23{,}600 tunes.
+Starting from a plain spiking transformer that scores 2.402 bits per token on held-out tunes, a sequence of
+changes brings it to 1.412: distillation from a non-spiking teacher of the same size, homeostatic regulation of
+firing rates, longer training with decaying auxiliary losses, spike dropout, and a new attention rule,
+\emph{\csq{} attention}, which weights each key by the square of the number of spikes it shares with the query.
+Count$^2$ attention sharpens attention without the training instability that learned count thresholds showed, and
+was the largest architectural gain. The final model outperforms a folk-rnn-style LSTM (1.591 bits/token) and
+closes 84\% of the gap between the plain spiking model and its teacher (1.220); 85\% of the bars it generates have
+the correct length.
+
+For hardware, the block is turned into integer arithmetic only: multi-bit residual inputs are rounded to their
+leading bit so that every weight multiplication becomes a shift, weights are 8-bit integers, layer normalisation
+uses integer statistics and a 16-entry reciprocal table, and the normalisation gain and bias are folded into
+12-bit spiking neurons. With quantization-aware training this costs 0.021 bits/token compared with an equally
+trained floating-point model. A bit-exact integer reference model and a datapath specification were written for
+a future accelerator.
+
+Finally, an energy estimate that counts memory traffic and compares against 8-bit baselines shows a modest
+picture: the spiking model needs about 7 times less energy per token than 32-bit floating-point models, but only
+1.2 to 1.65 times less than an 8-bit transformer, and only because most of its inputs are zero and can be skipped.

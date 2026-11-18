@@ -1,0 +1,121 @@
+\chapter{Integer datapath for hardware}
+\label{ch:hardware}
+
+This chapter turns the trained spiking block into arithmetic that a hardware accelerator can implement with
+integers only, and describes how energy is estimated. The goal is to accelerate the six spiking blocks; the
+embedding, input neurons and output head stay on a host processor.
+
+\section{Where the operations are}
+
+Instrumenting the trained model on validation text gave the operation counts in Table~\ref{tab:ops}. Two facts
+shaped the design.
+
+\begin{table}[t]
+\centering
+\caption[Operations per token inside the spiking blocks]{Operations per generated token inside the six blocks of
+the final model ($T=8$, 256-token context). ``Events'' are non-zero inputs, each of which adds one weight column.}
+\label{tab:ops}
+\small
+\begin{tabular}{llr}
+\toprule
+Operation & Inputs & Per token \\
+\midrule
+Linear layers reading the residual stream (Q/K/V, first MLP layer) & integers 0--13, 58\% non-zero & 11.9M events \\
+Linear layers reading spikes (projection, second MLP layer) & binary, 19\% non-zero & 3.3M events \\
+Normalisation & 122{,}880 elements & 0.5M operations \\
+LIF neurons & 122{,}880 neurons & 0.6M operations \\
+Attention (AND + popcount, square, accumulate) & 25\% of pairs overlap & 0.13M operations \\
+\midrule
+Weight columns fetched (once per token for all 8 steps) & & 2.78M weights \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+First, \textbf{the linear layers are 98\% of the arithmetic}, and most of them read the residual stream, whose
+values are not spikes but small integers. A synapse that receives the value 5 must add its weight five times or
+multiply. The claim that spiking networks need only additions does not hold for these layers.
+
+Second, \textbf{memory is the main cost}. The block has 4.7 million weights. If each layer processes all 8 time
+steps of a token together, a weight column can be fetched once and reused for every step in which its input is
+non-zero; a column whose input never fires is not fetched at all.
+
+\section{Shift-coded residual inputs}
+
+Each residual value $r \in \{0, \dots, 13\}$ is replaced by its leading bit, rounded on the first bit that is cut
+and saturated at 8:
+\begin{center}
+\begin{tabular}{l*{14}{c}}
+\toprule
+$r$ & 0 & 1 & 2 & 3 & 4 & 5 & 6 & 7 & 8 & 9 & 10 & 11 & 12 & 13 \\
+coded & 0 & 1 & 2 & 4 & 4 & 4 & 8 & 8 & 8 & 8 & 8 & 8 & 8 & 8 \\
+\bottomrule
+\end{tabular}
+\end{center}
+The product of a weight with a power of two is a shift, so the multiplier becomes a 4-way multiplexer that selects
+$w$, $2w$, $4w$ or $8w$. Cutting instead of rounding, or keeping two bits, was also tested
+(Section~\ref{sec:quant}); one rounded bit was the cheapest option that cost almost nothing. Values 12 and 13 would
+round to 16 but occur for only 0.001\% of inputs, so saturating at 8 is free.
+
+\section{Integer weights and normalisation}
+\label{sec:intnorm}
+
+\paragraph{Weights.} All weights of a linear layer share one int8 scale. Because the normalisation that follows
+divides by the vector's own spread, a common scale cancels: the normalisation can work directly on the integer
+accumulators, and the scale never has to be applied. One scale per output channel would be slightly more accurate
+but would need a multiplication per element to bring the channels to a common scale.
+
+\paragraph{Normalisation.} For a vector $x$ of $N$ accumulator values ($N$ = 256, 1{,}024 or 32 for a head):
+\begin{enumerate}
+  \item mean $= \mathrm{round}(\sum x / N)$: an adder tree and a shift, since $N$ is a power of two;
+  \item centred values $c = x - \text{mean}$ and $\mathrm{MAD} = \mathrm{round}(\sum |c| / N)$, held in 12 bits;
+  \item the reciprocal $1/\mathrm{MAD}$ from a leading-one detector and a table of 16 entries, indexed by the four
+        bits after the leading one;
+  \item $n = c \times \text{table entry}$, shifted by the leading-one position and rounded to Q4.7.
+\end{enumerate}
+The multiplication in step 4 (19 by 6 bits) is the only multiplier left in the block. Replacing it with a single
+shift, or the table with four entries, was tested and was not accurate enough (Section~\ref{sec:quant}).
+
+\section{Folding the normalisation into the neuron}
+
+The normalisation ends with $\gamma n + \beta$, which feeds the LIF neuron of Equation~\ref{eq:lif}. Because the
+neuron is linear below its threshold, both parameters can be moved into it. Dividing the membrane potential by
+$\gamma$ gives an equivalent neuron
+\begin{equation}
+  u \leftarrow \big(u + n + \beta/\gamma\big) \gg 1, \qquad \text{spike if } \gamma\,(u - 1/\gamma) \ge 0,
+  \qquad u \leftarrow u - 1/\gamma \text{ after a spike},
+\end{equation}
+with three constants per neuron: $1/\gamma$, $\beta/\gamma$ and the sign of $\gamma$, which decides the direction of
+the comparison. This is exact and removes the per-element multiplication by $\gamma$. All values are held in Q4.7.
+For 40 of the 15{,}360 neurons $|\gamma| < 0.05$, so $1/\gamma$ would not fit in 12 bits; these neurons barely depend on
+their input, fire at most once or twice per token, and are set to never fire, which does not change the accuracy.
+
+\section{Rounding, saturation and the attention}
+
+All rounding is half up (add half, then cut), which needs one adder. All registers saturate rather than wrap:
+accumulators at 18 bits (computed in 21 bits so that the summation order does not matter), attention sums at 16
+bits, the MAD at 12 bits, and neuron states at 12 bits. The residual stream never exceeds 13 and needs 4 bits. In the
+attention, counts, squares and sums are exact integers; the attention's fixed scale of $1/8$ is absorbed into the head
+normalisation's $\varepsilon$.
+
+\section{Quantization-aware training and the reference model}
+
+The trained model is fine-tuned for 5{,}000 steps with this entire datapath in the forward pass and straight-through
+gradients. The neurons' parameters stay $\gamma$ and $\beta$ and are folded on the fly, so the checkpoints keep their
+format.
+
+To hand the design to hardware, a reference model was written in pure integer arithmetic (NumPy int64). It reproduces
+the PyTorch simulation of the datapath exactly: 100\% of block outputs agreed over 8 test windows of 256 tokens, six
+blocks and eight time steps, and the test scores were identical. Writing it also exposed two bugs in the simulation
+--- on the GPU, \texttt{log2(8.0)} returned 2.999\dots{} and powers of two computed with \texttt{pow} were inexact,
+which flipped some roundings --- both fixed. The reference model produces test vectors for every stage of the block,
+and a specification documents every format, rounding rule and table (summarised in Appendix~\ref{app:spec}).
+
+\section{Energy model}
+\label{sec:energymodel}
+
+Energy is estimated per generated token as the sum, over operation types, of the number of operations times the
+energy of one operation. The counts are measured on the models; the energies follow the 45\,nm figures of
+\citet{horowitz2014energy}, with interpolations where needed (Appendix~\ref{app:energy}). Weights and caches are
+assumed to sit in on-chip memory at 4\,pJ per byte, between the cost of a 32\,KB and a 1\,MB memory; since this
+assumption matters, results are also given for 1.25, 12.5 and 160\,pJ per byte. Leakage, control logic and data
+movement between units are not included, so the numbers are best read as ratios between models.

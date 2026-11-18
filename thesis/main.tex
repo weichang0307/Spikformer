@@ -1,0 +1,72 @@
+% Bachelor thesis, generic layout. Replace the title-page fields and, if your department provides one, the
+% document class / template. Compile with pdfLaTeX + BibTeX (e.g. upload this folder to Overleaf).
+\documentclass[12pt, a4paper, oneside]{report}
+
+\usepackage[a4paper, margin=2.5cm]{geometry}
+\usepackage[T1]{fontenc}
+\usepackage{lmodern}
+\usepackage{setspace}
+\onehalfspacing
+\usepackage{amsmath, amssymb}
+\usepackage{graphicx}
+\usepackage{booktabs}
+\usepackage{tabularx}
+\usepackage{xcolor}
+\usepackage[numbers, sort&compress]{natbib}
+\usepackage{tikz}
+\usetikzlibrary{arrows.meta, positioning, fit, calc}
+\usepackage[font=small, labelfont=bf]{caption}
+\usepackage{float}
+\usepackage{url}
+\usepackage[hidelinks]{hyperref}
+
+\newcommand{\csq}{count$^2$}
+\newcommand{\fillin}[1]{\textcolor{red}{[#1]}}
+
+\begin{document}
+
+% ---------------------------------------------------------------- title page
+\begin{titlepage}
+\centering
+\vspace*{1.5cm}
+{\large \fillin{University name}\par}
+{\large \fillin{Faculty / Department}\par}
+\vspace{2cm}
+{\LARGE\bfseries A Multiplier-Free Spiking Transformer\\[4pt] for Symbolic Music Generation\par}
+\vspace{1cm}
+{\large Count-squared spiking attention, an integer datapath for hardware,\\ and an honest look at energy\par}
+\vspace{2.5cm}
+{\large Bachelor Thesis\par}
+\vspace{1cm}
+{\large \fillin{Author name}\par}
+\vspace{0.5cm}
+{\large Supervisor: \fillin{Supervisor name}\par}
+\vfill
+{\large \fillin{Month Year}\par}
+\end{titlepage}
+
+\pagenumbering{roman}
+\input{chapters/abstract}
+\tableofcontents
+\listoffigures
+\listoftables
+\input{chapters/abbreviations}
+
+\cleardoublepage
+\pagenumbering{arabic}
+\input{chapters/introduction}
+\input{chapters/background}
+\input{chapters/related}
+\input{chapters/methods}
+\input{chapters/hardware}
+\input{chapters/results}
+\input{chapters/discussion}
+\input{chapters/conclusion}
+
+\bibliographystyle{plainnat}
+\bibliography{refs}
+
+\appendix
+\input{chapters/appendix}
+
+\end{document}

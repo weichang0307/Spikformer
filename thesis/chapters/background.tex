@@ -1,0 +1,131 @@
+\chapter{Background}
+\label{ch:background}
+
+\section{Language modelling and bits per token}
+
+A language model assigns a probability to every possible next token given the tokens so far,
+$p(x_t \mid x_{<t})$. Generation samples from this distribution one token at a time. Training minimises the
+cross-entropy $-\log p(x_t \mid x_{<t})$ averaged over the training text. Measured in base 2, this average is the
+number of \emph{bits per token}: the length, in bits, of the code a compressor built from the model would need per
+token \citep{shannon1948}. Lower is better, and differences are easy to interpret: a model at 1.4 bits/token needs
+about 13\% fewer bits than one at 1.6. All scores in this thesis are bits per token on a held-out test split.
+
+\section{Transformers}
+
+A transformer \citep{vaswani2017attention} turns each token into a vector (an \emph{embedding} plus a position
+embedding) and passes the sequence of vectors through a stack of identical blocks. Each block has two parts, each
+wrapped in a residual connection $x \leftarrow x + f(\mathrm{norm}(x))$:
+
+\paragraph{Self-attention.} Every position $i$ computes a query $q_i$, a key $k_i$ and a value $v_i$ by linear
+projections. Its output is a weighted average of the values of all earlier positions $j \le i$:
+\begin{equation}
+  \mathrm{out}_i = \sum_{j \le i} \alpha_{ij} v_j, \qquad
+  \alpha_{ij} = \frac{\exp(q_i \cdot k_j / \sqrt{d})}{\sum_{j' \le i} \exp(q_i \cdot k_{j'} / \sqrt{d})} .
+\end{equation}
+The softmax makes the weights positive and sum to one, and because of the exponential, a few keys with high scores
+can take almost all of the weight. Attention is computed in parallel by several \emph{heads} with their own
+projections. During generation, keys and values of past positions are stored in a \emph{K/V cache} so that each
+new token only computes its own.
+
+\paragraph{Feed-forward network (MLP).} Two linear layers with a nonlinearity in between, applied to each position
+separately, usually four times wider in the middle.
+
+\paragraph{Layer normalisation.} Before each part, every vector is normalised to zero mean and unit standard
+deviation and then scaled and shifted by learned per-channel parameters $\gamma$ and $\beta$
+\citep{ba2016layernorm}.
+
+\section{Recurrent networks and the LSTM}
+
+A recurrent network reads tokens one at a time and keeps a state vector that summarises everything seen so far.
+The long short-term memory (LSTM) \citep{hochreiter1997lstm} uses gates to decide what to keep in a cell state, which
+lets it remember over long ranges. Its cost per token is constant and its state is small, but it cannot look back
+at a specific earlier token directly as attention can. folk-rnn \citep{sturm2016folkrnn}, the reference system for
+the dataset used here, is a three-layer LSTM with 512 units per layer.
+
+\section{Spiking neurons}
+
+Biological neurons communicate with short electrical pulses. The \emph{leaky integrate-and-fire} (LIF) neuron is
+the standard simplified model \citep{gerstner2014neuronal}: a membrane potential $v$ integrates its input, leaks
+toward zero, and emits a spike when it crosses a threshold. In discrete time with time constant 2 and threshold 1,
+as used throughout this thesis:
+\begin{equation}
+  v_t = \tfrac{1}{2}\,(v_{t-1} + x_t), \qquad s_t = \begin{cases} 1 & v_t \ge 1 \\ 0 & \text{otherwise} \end{cases},
+  \qquad v_t \leftarrow v_t - s_t .
+  \label{eq:lif}
+\end{equation}
+The last step is a \emph{soft reset}: after a spike the threshold is subtracted rather than the potential zeroed,
+so no input is lost. A neuron that receives a constant input $x$ for $T$ time steps fires about $xT$ times
+(\emph{rate coding}): the spike count over the time steps represents a number with a resolution of $1/T$.
+
+In a spiking network every layer's output is a spike, and the next layer's linear operation
+$\sum_i w_{oi} s_i$ only needs to add the weights of inputs that spiked. A token is simulated for $T$ time steps
+(here 4--8), so a spiking network does $T$ forward passes per token, each sparse and multiplication-free.
+
+\section{Training spiking networks}
+
+The spike function is a step, whose derivative is zero almost everywhere, so ordinary backpropagation cannot train
+it. \emph{Surrogate gradients} \citep{neftci2019surrogate} keep the step in the forward pass but use the derivative
+of a smooth function in the backward pass; here, a sigmoid $\sigma(\alpha(v-1))$ with sharpness $\alpha$.
+Gradients flow back through all $T$ time steps.
+
+\section{Spiking transformers}
+
+In a spiking transformer, queries, keys and values are spikes. The product $q_i \cdot k_j$ of two binary vectors is
+the number of channels in which both spiked, an integer between 0 and the head width. Spikformer
+\citep{zhou2023spikformer} uses these counts directly as attention weights, without a softmax, since a softmax
+would need exponentials and divisions:
+\begin{equation}
+  \mathrm{out}_i = \sum_{j \le i} (q_i \cdot k_j)\, v_j .
+\end{equation}
+Without the softmax, nothing makes a few keys dominate: a key that shares one spike with the query still gets a
+third of the weight of one that shares three. Chapter~\ref{ch:methods} returns to this.
+
+\section{Knowledge distillation}
+
+A small or constrained \emph{student} model often learns better from the full output distribution of a stronger
+\emph{teacher} than from the training labels alone \citep{hinton2015distilling}: the teacher's probabilities show
+which wrong answers are nearly right. The student minimises a mix of the usual cross-entropy and the KL divergence
+to the teacher's distribution. Attention maps can be distilled in the same way \citep{jiao2020tinybert,
+wang2020minilm}. For KL divergences between distributions $p$ (teacher) and $q$ (student), the \emph{forward}
+direction $\mathrm{KL}(p\,\|\,q)$ penalises the student for missing any of the teacher's mass and makes it spread
+out; the \emph{reverse} direction $\mathrm{KL}(q\,\|\,p)$ penalises mass where the teacher has little and lets the
+student focus on the teacher's main modes.
+
+\section{Quantization}
+
+Hardware is cheaper and more efficient with low-precision integers than with 32-bit floating point (fp32).
+\emph{Quantization} maps weights and activations to integers: an int8 weight $w_q \in \{-127, \dots, 127\}$ stands
+for $s\, w_q$ with a scale $s$, for example one scale per tensor or per output channel \citep{jacob2018quantization}.
+Intermediate values are stored in \emph{fixed point}: Q4.7 denotes a 12-bit signed integer read as
+$\mathrm{int}/128$, with range $[-16, 16)$. Every conversion needs a rounding rule (here: round half up) and a rule
+for overflow (here: saturate at the largest value).
+
+\emph{Post-training quantization} (PTQ) quantizes a trained model as it is. \emph{Quantization-aware training} (QAT)
+continues training with the quantized arithmetic in the forward pass; the rounding has zero gradient, so the
+backward pass treats it as the identity, the \emph{straight-through estimator} \citep{bengio2013estimating}.
+Multiplications by powers of two are shifts \citep{elhoushi2021deepshift}.
+
+\section{Energy of hardware operations}
+
+Arithmetic and memory access have very different costs. In a classic 45\,nm estimate \citep{horowitz2014energy}, a
+32-bit floating-point multiplication costs about 3.7\,pJ and an addition 0.9\,pJ, an 8-bit integer multiplication
+0.2\,pJ and an addition 0.03\,pJ, while reading 64 bits from a 1\,MB on-chip memory costs about 100\,pJ, and from
+off-chip DRAM about 1.3\,nJ. Memory traffic therefore often dominates. Comparisons of spiking and conventional
+networks that only count additions against fp32 multiply--accumulates can overstate the spiking advantage; recent
+work argues that the fair reference is a quantized ANN and that memory access must be included
+\citep{yan2024reconsidering, shen2024efficient}.
+
+\section{ABC notation and the folk-rnn corpus}
+
+ABC is a plain-text notation for folk music. In the folk-rnn version \citep{sturm2016folkrnn}, every tune is
+transposed to C and written as a sequence of tokens:
+
+\begin{center}
+\texttt{M:6/8 K:Cmaj |: G c c B c d | e 2 d c B A | \dots{} :|}
+\end{center}
+
+A tune starts with a meter (\texttt{M:6/8}) and a mode (\texttt{K:Cmaj}). Notes are letters (\texttt{c} is an
+octave above \texttt{C}), numbers multiply the default length of an eighth note (\texttt{e 2} is a quarter note),
+\texttt{|} separates bars, \texttt{|:} and \texttt{:|} enclose a repeated section, and \texttt{|1}, \texttt{|2}
+mark first and second endings. In 6/8 every bar must add up to six eighths. The corpus has about 23{,}600 tunes,
+135 distinct tokens and a median tune length of 152 tokens.

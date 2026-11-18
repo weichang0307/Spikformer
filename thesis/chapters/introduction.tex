@@ -1,0 +1,63 @@
+\chapter{Introduction}
+\label{ch:intro}
+
+\section{Motivation}
+
+Large language models are expensive to run. Most of their energy goes into multiplying activations by weights
+and into moving those weights from memory to the arithmetic units. Spiking neural networks (SNNs), inspired by
+the brain, take a different approach: neurons exchange binary \emph{spikes}, so a synapse only does work when its
+input neuron fires, and that work is an addition of the weight rather than a multiplication. If most neurons are
+silent most of the time, a spiking network could need far less energy than a conventional one.
+
+Transformers \citep{vaswani2017attention} dominate sequence modelling today, and several groups have built
+spiking versions of them \citep{zhou2023spikformer, yao2023spikedriven, zhu2023spikegpt}. These models usually
+report energy savings of an order of magnitude or more. Two questions motivated this thesis: how close can a
+spiking transformer come to a conventional one on a real generation task, and how much energy does it actually
+save once it is designed for hardware and compared fairly?
+
+The task chosen is symbolic music generation. Folk tunes written in ABC notation are short, highly structured
+texts: a tune has a meter, a mode, bars whose note durations must add up to the meter, and repeat signs that must
+pair up. This makes it possible to judge a model not only by how well it predicts the next symbol but also by
+whether the music it writes is well-formed, and the folk-rnn corpus \citep{sturm2016folkrnn} provides an
+established LSTM baseline.
+
+\section{Goals}
+
+\begin{enumerate}
+  \item Build a spiking transformer that generates folk tunes in ABC notation, and bring its quality as close as
+        possible to a non-spiking transformer of the same size.
+  \item Understand which design choices matter for spiking attention and training, including the ones that fail.
+  \item Turn the spiking block into a datapath that hardware can implement with integer arithmetic only, and
+        measure the accuracy cost.
+  \item Estimate the energy per generated token and compare it fairly with conventional models, including
+        8-bit quantized ones.
+\end{enumerate}
+
+\section{Contributions}
+
+\begin{itemize}
+  \item \textbf{\csq{} attention}, a spiking attention rule that weights each key by the square of its spike
+        overlap with the query. It improves test bits/token by 0.10 over a learned count threshold, raises the
+        share of correctly timed bars in generated tunes from 50\% to 58\% in short runs, and avoids an
+        instability of integer thresholds that this thesis analyses.
+  \item \textbf{A training recipe} for spiking transformers on a small dataset: distillation from a same-size
+        ANN with a reverse attention loss, an attention-spread penalty, homeostasis, decaying schedules and spike
+        dropout. The final model reaches 1.412 bits/token, ahead of a folk-rnn-style LSTM (1.591).
+  \item \textbf{A multiplier-free integer datapath} for the spiking block (shift-coded residual inputs, int8
+        weights, integer layer normalisation with a 16-entry reciprocal table, normalisation folded into 12-bit
+        neurons), trained with quantization-aware training, with a bit-exact reference model and a hardware
+        specification.
+  \item \textbf{A fair energy comparison} against fp32 and int8 versions of the ANN and the LSTM, including memory
+        traffic and a sensitivity analysis.
+\end{itemize}
+
+\section{Outline}
+
+Chapter~\ref{ch:background} explains the necessary background: language modelling, transformers, LSTMs, spiking
+neurons, distillation, quantization and ABC notation. Chapter~\ref{ch:related} reviews related work.
+Chapter~\ref{ch:methods} describes the spiking model, \csq{} attention and the training recipe, and
+Chapter~\ref{ch:hardware} the integer datapath and energy model. Chapter~\ref{ch:results} presents the
+experiments: a preliminary phase on English text, the development of the folk-music model, the attention
+variants, the step to integer arithmetic, an analysis of the final model, and the comparison with other models.
+Chapter~\ref{ch:discussion} discusses what the results mean and their limitations, and
+Chapter~\ref{ch:conclusion} concludes.

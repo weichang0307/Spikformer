@@ -1,0 +1,136 @@
+\chapter{Model and training}
+\label{ch:methods}
+
+\section{Architecture}
+
+\begin{figure}[t]
+\centering
+\begin{tikzpicture}[font=\scriptsize, node distance=2.5mm and 3.2mm,
+    box/.style={draw, rounded corners=1.5pt, minimum height=6mm, inner sep=2.5pt, align=center},
+    acc/.style={box, fill=blue!10, draw=blue!60!black, thick},
+    arr/.style={-{Latex[length=1.6mm]}, thin}]
+  \node[box] (in) {input spikes $S_t$\\(embedding, L1, LIF)};
+  \node[box, right=of in] (qkv) {Q, K, V:\\Linear $\to$ L1 $\to$ LIF};
+  \node[acc, right=of qkv] (att) {\csq{} attention\\$\sum_j (q_i\!\cdot\!k_j)^2\, v_j$};
+  \node[box, right=of att] (hn) {head L1 $\to$ LIF\\$\to$ proj (L1, LIF)};
+  \node[box, below=7mm of hn] (add1) {$x \mathrel{+}= $ spikes};
+  \node[box, left=of add1] (mlp) {MLP $256\!\to\!1024\!\to\!256$\\(Linear $\to$ L1 $\to$ LIF)$\times$2};
+  \node[box, left=of mlp] (add2) {$x \mathrel{+}= $ spikes};
+  \node[box, left=of add2] (out) {mean over $T$\\$\to$ linear head};
+  \draw[arr] (in) -- (qkv); \draw[arr] (qkv) -- (att); \draw[arr] (att) -- (hn);
+  \draw[arr] (hn) -- (add1); \draw[arr] (add1) -- (mlp); \draw[arr] (mlp) -- (add2); \draw[arr] (add2) -- (out);
+  \node[draw, dashed, rounded corners, fit=(qkv)(att)(hn)(add1)(mlp)(add2), inner sep=3mm,
+        label={[font=\scriptsize]above:spiking block, $\times 6$, all $T$ time steps}] {};
+\end{tikzpicture}
+\caption[Architecture of the spiking transformer]{Architecture of the spiking transformer. Inside a block every
+arrow carries binary spikes except the residual stream $x$, which holds small integers (counts of spikes added so
+far).}
+\label{fig:arch}
+\end{figure}
+
+The spiking transformer (Figure~\ref{fig:arch}) has the same shape as a standard pre-normalised transformer: 6
+blocks of width 256 with 8 attention heads of 32 channels, an MLP of width 1{,}024, a context of 256 tokens and 4.89
+million parameters. The differences are in what flows between the layers:
+
+\begin{itemize}
+  \item \textbf{Input.} The token and position embeddings are normalised and fed as a constant input current to a
+        layer of LIF neurons for $T$ time steps, producing $T$ binary spike vectors per token.
+  \item \textbf{Every linear layer is followed by a normalisation and a LIF neuron}, so every layer outputs spikes.
+        The normalisation is an \emph{L1} layer norm: it subtracts the mean and divides by the mean absolute
+        deviation (MAD) instead of the standard deviation, which avoids a square root.
+  \item \textbf{Attention} uses spike counts (Section~\ref{sec:csq}) followed by a per-head L1 normalisation and a
+        LIF neuron, then a projection layer.
+  \item \textbf{The residual stream} adds the spikes of the attention and MLP outputs to $x$. After block $k$ it
+        holds integers from 0 to $2k+3$, at most 13.
+  \item \textbf{Read-out.} The residual stream is averaged over the $T$ time steps (a firing rate) and a linear
+        head produces the next-token distribution.
+\end{itemize}
+
+The non-spiking \emph{teacher} used for distillation is a transformer of exactly the same shape with standard layer
+norms, softmax attention and GELU activations (4.87 million parameters).
+
+\section{Spike-count attention and \csq{} attention}
+\label{sec:csq}
+
+In spiking attention the score of key $j$ for query $i$ is the overlap count
+$c_{ij} = q_i \cdot k_j = \mathrm{popcount}(q_i \wedge k_j)$, an integer from 0 to 32 per head and time step.
+Measurements showed that this attention is much broader than the teacher's: rows of normalised counts had a
+normalised entropy (the ``spread'') of about 0.8, where 1 means uniform.
+
+\paragraph{Count$^2$ attention.} The rule proposed here squares the counts:
+\begin{equation}
+  a_i = \sum_{j \le i} c_{ij}^{\,2}\; v_j .
+\end{equation}
+A key that shares four spikes with the query now counts sixteen times as much as one that shares a single spike,
+instead of four times, so strong matches dominate, as with a softmax, but weak matches still contribute a little.
+The rule has no parameters and no discontinuities. In hardware the square of a count from 0 to 32 is a lookup in a
+33-entry table, and pairs with a count of zero, about three quarters of all pairs in the final model, are skipped.
+
+\paragraph{Count thresholds (explored, not used).} Before \csq{} attention, two threshold-based alternatives were
+tried: keeping a count only if it reaches a threshold $\theta$ (a soft winner-take-all), either fixed or learned per
+head with a sigmoid surrogate gradient. They are described with their results in Section~\ref{sec:attn}, because
+the way they fail is instructive: counts are integers, so every $\theta$ between 1 and 2 has exactly the same effect,
+and a $\theta$ that reaches an integer changes a whole head's attention at once.
+
+\section{Training recipe}
+\label{sec:recipe}
+
+\paragraph{Distillation.} The training loss combines four terms:
+\begin{equation}
+  \mathcal{L} = \lambda_{\mathrm{CE}}\, \mathrm{CE} + (1-\lambda_{\mathrm{CE}})\, \mathrm{KL}(p_{\mathrm{teacher}}
+  \,\|\, p_{\mathrm{student}}) + \lambda_{\mathrm{att}}\, \mathrm{KL}(\hat{a}_{\mathrm{student}} \,\|\,
+  a_{\mathrm{teacher}}) + \lambda_{\mathrm{spread}}\, H(\hat{a}_{\mathrm{student}}) .
+\end{equation}
+The first two terms distil the output distribution. The third compares the student's attention rows, normalised to
+sum to one, with the teacher's softmax attention on 64 randomly sampled query rows per batch in blocks 1--5, head by
+head. It uses the \emph{reverse} KL direction: the forward direction made spiking attention flatter, because it
+punishes any key the teacher looks at slightly but the student ignores.
+
+\paragraph{Spread penalty.} The fourth term is the normalised entropy of the student's attention rows,
+$H/\log(\text{number of visible keys})$. It pushes attention to concentrate, which the distillation loss alone did
+not achieve.
+
+\paragraph{Homeostasis.} Some neurons stop firing during training and never recover, because their surrogate
+gradient becomes tiny. A homeostatic rule \citep{turrigiano2004homeostatic} nudges the normalisation bias of every
+neuron that fires in fewer than 1\% of time steps up, and of every neuron that fires in more than 50\% down, with a
+small rate and a cap on the total shift. Without the cap, the rule fought the learned biases and caused gradient
+spikes.
+
+\paragraph{Spike dropout.} During training, each block's attention and MLP output spikes are dropped with
+probability $p$ before they are added to the residual stream, and kept spikes are scaled by $1/(1-p)$ so the
+expected residual is unchanged \citep{srivastava2014dropout}. At inference nothing is dropped and all spikes are
+binary.
+
+\paragraph{Schedules.} Count$^2$ attention and the spread penalty are blended in over the first 2{,}000 steps. From
+step 2{,}000 to 30{,}000 the output-KL weight, the attention-KL weight and the spread penalty decrease linearly to
+zero while the sharpness $\alpha$ of the surrogate gradient increases from 2 to 4; after that training continues on
+cross-entropy alone. Every change is linear: switching $\alpha$ abruptly from 2 to 1 in one step, in an early
+experiment, raised the validation loss from 1.87 to 2.70, because the optimiser's running estimates of the gradient
+scale no longer matched.
+
+\paragraph{Optimisation.} AdamW \citep{loshchilov2019adamw} with learning rate $7 \times 10^{-4}$, 500 warm-up steps
+and cosine decay, batches of 64 sequences of 256 tokens, bf16 arithmetic, and a per-block gradient clipping that
+limits each block's gradient norm to three times its running average. All hyperparameters are listed in
+Appendix~\ref{app:hp}.
+
+\section{Evaluation}
+\label{sec:eval}
+
+\paragraph{Prediction.} Bits per token on the full test split, scored with a sliding window of 256 tokens moved by
+128, so that every token is predicted with at least 128 tokens of context.
+
+\paragraph{Generated tunes.} 500 tunes are sampled at temperature 1, each starting from the beginning-of-tune token.
+Four automatic checks are applied:
+\begin{itemize}
+  \item \textbf{Correct bars}: the share of bars whose note durations add up to the meter (first and last bars are
+        excluded, since pick-up bars are allowed to be short).
+  \item \textbf{Header}: exactly one meter followed by exactly one mode at the start.
+  \item \textbf{Balanced repeats}: as many closing as opening repeat signs (one missing opening sign at the start
+        is allowed) and as many second as first endings.
+  \item \textbf{Ends on C}: the last note is the tonic.
+\end{itemize}
+Real test tunes score 89.9\%, 100\%, 80.3\% and 62.8\% on these checks; the repeat check is stricter than real
+practice. With 500 tunes the checks vary by about $\pm$2--3 percentage points between samples.
+
+\paragraph{Baselines.} The ANN teacher (10{,}000 steps) and a folk-rnn-style LSTM with three layers of 512 units and
+one-hot input (5.60 million parameters, 30{,}000 steps), both trained on the same split.
